@@ -567,6 +567,11 @@ fn not_installed(provider: &str, host: &str, installed: bool) -> Result<()> {
 /// folders the app searches; `providers::discover` would also run `--version` on all of them
 /// (2-4 s) just to read a list this check ignores.
 pub(crate) async fn require_installed(provider: &str) -> Result<()> {
+    if provider == "cursor" {
+        // A fresh or headless host has no verdict yet: wait for the first probe.
+        let installed = crate::providers::cursor::accepted_executable().await.is_some();
+        return not_installed(provider, &super::config::device_name(), installed);
+    }
     let id = provider.to_owned();
     let installed = tauri::async_runtime::spawn_blocking(move || crate::providers::PROVIDERS.iter().any(|(known, _)| *known == id) && crate::providers::executable(&id).is_some()).await.map_err(|e| e.to_string())?;
     not_installed(provider, &super::config::device_name(), installed)
@@ -896,6 +901,21 @@ mod tests {
         assert_eq!(not_installed("claude", "Studio", true), Ok(()));
         assert_eq!(not_installed("claude", "Studio", false), Err("Claude Code is not installed on Studio.".into()));
         assert_eq!(not_installed("nope", "Studio", false), Err("nope is not installed on Studio.".into()));
+    }
+
+    // The probe tests hold `probe_test_guard()` on purpose.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_cold_cursor_start_waits_for_the_first_probe() {
+        let _guard = crate::providers::cursor::probe_test_guard();
+        crate::providers::cursor::set_probe_for_test(vec![PathBuf::from("/x/agent")], |_| {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            Ok(json!({"protocolVersion":1,"authMethods":[{"id":"cursor_login"}]}))
+        });
+        assert_eq!(crate::providers::cursor::cached_installed(), None, "no verdict yet");
+        assert_eq!(require_installed("cursor").await, Ok(()));
+        crate::providers::cursor::set_probe_for_test(vec![PathBuf::from("/x/agent")], |_| Err("missing".into()));
+        assert!(require_installed("cursor").await.unwrap_err().starts_with("Cursor CLI is not installed on "));
     }
 
     #[cfg(unix)]

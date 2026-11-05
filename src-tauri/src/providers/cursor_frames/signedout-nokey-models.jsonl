@@ -1,0 +1,3 @@
+{"args":["models"]}
+{"t":973,"dir":"stderr","text":"Error: Authentication required. Run 'agent login', pass --api-key/--auth-token, or set CURSOR_API_KEY/CURSOR_AUTH_TOKEN.\n"}
+{"t":989,"dir":"exit","code":1,"signal":null}

@@ -442,6 +442,8 @@ impl Protocol {
             };
             if self.config.provider == "muse" {
                 step.write.push(self.muse_answer(&request, &json!({"answers":{}})));
+            } else if self.config.provider == "cursor" {
+                step.write.push(super::cursor::cancel_reply(&request));
             } else if let Ok(result) = host_inputs::answer(&request, response) {
                 step.write.push(json!({"id":request["id"],"result":result}));
             }

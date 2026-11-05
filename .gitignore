@@ -18,3 +18,5 @@ website/.astro/
 *.p8
 *.key
 *.pem
+
+.scratch/

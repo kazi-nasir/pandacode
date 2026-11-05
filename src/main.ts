@@ -988,7 +988,7 @@ function finishLiveMessage(current: Stream, sessionId: string): void {
   current.tools.push({ key: current.retainedMessageKey, content: current.text.length > 16384 ? current.text.slice(0, 16384) + '\n[Activity preview truncated]' : current.text, commentary: true });
   trimLiveActivity(current, sessionId); current.revision++;
 }
- function shortProvider(id: ProviderId): string { return ({ claude: 'Claude', codex: 'Codex', kimi: 'Kimi', opencode: 'OpenCode', glm: 'GLM', antigravity: 'Antigravity', grok: 'Grok', mimo: 'MiMo', pi: 'Pi', deepseek: 'DeepSeek', commandcode: 'Command Code', cline: 'Cline', kilo: 'Kilo', omp: 'omp', 'github-copilot': 'GitHub Copilot CLI', muse: 'Muse Code', devin: 'Devin', zcode: 'ZCode', hermes: 'Hermes' })[id]; }
+ function shortProvider(id: ProviderId): string { return ({ claude: 'Claude', codex: 'Codex', kimi: 'Kimi', opencode: 'OpenCode', glm: 'GLM', antigravity: 'Antigravity', grok: 'Grok', mimo: 'MiMo', pi: 'Pi', deepseek: 'DeepSeek', commandcode: 'Command Code', cline: 'Cline', kilo: 'Kilo', omp: 'omp', 'github-copilot': 'GitHub Copilot CLI', muse: 'Muse Code', devin: 'Devin', zcode: 'ZCode', hermes: 'Hermes', cursor: 'Cursor CLI' })[id]; }
 function selectedModel(s: Session): ProviderModel { return provider(s.provider)?.models.find(model => model.id === (s.model || 'default')) ?? fallbackModel(s.provider, s.model); }
 function modelLabel(s?: Session, withEffort = true): string {
   if (!s) return 'Default model';
@@ -4895,6 +4895,28 @@ function showDeleteTask(task = session()): void {
   });
 }
 function showRename(task?: Session): void { const s = task ?? session(); if (!s) return; modal('Rename task', `<form id="rename-form" data-session-id="${escape(s.id)}"><label for="task-title" class="field-label">Task name</label><input id="task-title" name="title" value="${escape(s.title)}" maxlength="200" required><div class="dialog-footer"><button type="button" class="secondary-button" data-action="close-dialog">Cancel</button><button class="primary-button">Save</button></div></form>`); document.querySelector<HTMLInputElement>('#task-title')?.select(); }
+/** Replaces the provider list from the cached (non-force) native list, keeping model lists of unchanged harnesses. */
+async function refreshProviderList(): Promise<void> {
+  const providers = await call<Provider[]>('list_providers');
+  const openPicker = document.querySelector<HTMLElement>('[data-action="model"][aria-expanded="true"], [data-action="default-model"][aria-expanded="true"]');
+  const pickerAction = openPicker?.dataset.action;
+  const pickerInPanel = Boolean(openPicker?.closest('.btw-panel'));
+  for (const found of providers) {
+    const previous = provider(found.id);
+    if (previous?.path === found.path && previous?.version === found.version) found.models = previous.models;
+  }
+  state.providers = providers;
+  if (openPicker) closeModelPicker();
+  renderComposer();
+  settingsView?.updateProviders(state.providers);
+  if (!openPicker) return;
+  const anchor = pickerAction === 'default-model'
+    ? document.querySelector<HTMLElement>('#default-model')
+    : pickerInPanel ? document.querySelector<HTMLElement>('.btw-panel [data-action="model"]') : document.querySelector<HTMLElement>('#model-picker-trigger');
+  if (!anchor) return;
+  if (pickerAction === 'default-model') await showDefaultModel(anchor);
+  else if (pickerAction === 'model') await showModel(anchor, actionTask(anchor));
+}
 let settingsDiscoveryGeneration = 0;
 async function discoverSettingsProviders(): Promise<Provider[]> {
   const generation = ++settingsDiscoveryGeneration;
@@ -6240,6 +6262,8 @@ function refreshFileIcons(): void { if (state.inspector && state.inspectorTab ==
 async function boot(): Promise<void> {
   await subscribe('agent-event', onAgent);
   await subscribe('provider-models-changed', event => invalidateModels(event.provider));
+  // A background handshake (Cursor CLI) settled: take the new list without a forced re-scan.
+  await subscribe('providers-changed', () => run(refreshProviderList()));
   await subscribe('architect-event', onArchitect);
   window.addEventListener(TEAM_MODE_EVENT, () => { if (session()) renderComposer(); });
   await subscribe('sessions-deleted', event => removeDeletedSessions(event.sessionIds));

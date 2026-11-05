@@ -3,7 +3,7 @@
 A small, native desktop workspace for coding agents. PandaCode runs the coding
 CLIs you already use — **Claude Code, Codex, Kimi Code, OpenCode, GLM Coding
 Plan and Xiaomi MiMo** (through Claude Code), **GitHub Copilot CLI, Antigravity,
-xAI's Grok Build, DeepSeek, Command Code, Cline, Kilo Code, Devin CLI and Hermes Agent** (through ACP), **ZCode** (through its app-server protocol), **Pi** and its
+xAI's Grok Build, DeepSeek, Command Code, Cline, Kilo Code, Devin CLI, Cursor CLI and Hermes Agent** (through ACP), **ZCode** (through its app-server protocol), **Pi** and its
 fork **omp** (through Pi's RPC mode), and Meta's **Muse Code** (through its MSP
 protocol) — side by side, with your projects, Git, a
 terminal and a browser in one window.
@@ -152,6 +152,7 @@ information:
 | What | Where | How often |
 | --- | --- | --- |
 | Latest versions of installed coding CLIs | `formulae.brew.sh`, `downloads.claude.ai`, `api.github.com`, `cdn.kimi.com`, `registry.npmjs.org` (Cline) | About every 6 hours |
+| Cursor CLI (only if you have it): PandaCode itself makes no request to Cursor and checks no Cursor release feed. It starts your local CLI, which may contact Cursor under your Cursor account or update itself. The first provider list of each launch starts the program first on PATH named `agent` (then `cursor-agent`) with the argument `acp` and sends one `initialize`, before it knows the program is Cursor (so an unrelated program named `agent` is started once per launch with that argument, and again once per Cursor run, model list or start attempted while Cursor is not found); it is accepted only if its reply identifies Cursor. That first list does not run `--version`. After a verdict is stored, the next provider list runs `--version` once and keeps the string for the process; Refresh drops it and the following list runs it once more. `agent models` runs when Cursor's model list is loaded (the model picker, or opening a Cursor task); a successful list is reused for 5 minutes, a failed one (for example signed out) runs again on the next load, and Refresh runs it again. `agent acp` runs for each Cursor task. The 6-hour version check above does not start Cursor. Settings → Privacy lists Cursor as having no verified telemetry opt-out | Your local `agent` / `cursor-agent` program; whatever it contacts is under your Cursor account | At the first provider list of each launch, then as described |
 | Plan usage checks for your signed-in agents | That agent's provider | When you open the menu bar item or the Usage dialog |
 | Public model price list (for cost estimates) | `raw.githubusercontent.com` | Daily |
 | PandaCode's own updates (`latest.json` on this repository's latest release) | `github.com` | At launch and about every 6 hours unless Settings → About → Updates is Off |
@@ -226,6 +227,8 @@ Muse Code installs with Meta's launcher into `~/.local/bin/muse`; run `muse logi
 [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli) installs with `npm install -g @github/copilot`; run `copilot login` in a terminal, then select **GitHub Copilot CLI** in PandaCode. PandaCode launches the local `copilot` executable over ACP. The CLI manages its own sign-in. See [provider details](docs/providers.md#github-copilot-cli).
 
 [Devin CLI](https://docs.devin.ai/cli) installs with `curl -fsSL https://cli.devin.ai/install.sh | bash` (or `brew install --cask devin-cli`, or the copy bundled with Devin Desktop); run `devin auth login` once in a terminal, then select **Devin CLI** in PandaCode. PandaCode launches `devin acp` with the CLI's own sign-in and lists every Devin model with its own thinking levels. See [provider details](docs/providers.md#devin-cli).
+
+[Cursor CLI](https://cursor.com/docs/cli) is installed by you (Cursor's installer puts `agent` and the alias `cursor-agent` on PATH; on Windows the official installer's `agent.cmd`); run `agent login` once in a terminal, or set `CURSOR_API_KEY` or `CURSOR_AUTH_TOKEN`, then select **Cursor CLI** in PandaCode. A Settings executable override or a named connection's binary also works. PandaCode accepts a program only after its ACP `initialize` reply identifies Cursor (never the editor command `cursor`), launches `agent acp`, and lists the models `agent models` prints. PandaCode does not install, update, sign in to or sign out of the CLI. See [provider details](docs/providers.md#cursor-cli).
 
 [ZCode](https://github.com/zai-org/ZCode) installs with its install script (`~/.local/bin/zcode`, Node 24); run `zcode` once in a terminal and sign in, then select **ZCode** in PandaCode. PandaCode talks to `zcode app-server` directly — the CLI's own protocol, since it exposes no ACP mode — listing every model the account can reach with its own reasoning levels. See [provider details](docs/providers.md#zcode).
 

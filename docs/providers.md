@@ -1,7 +1,7 @@
 # Provider integrations
 
 PandaCode launches each installed CLI directly. Claude, Codex, Kimi, OpenCode,
-Antigravity, Grok Build, Devin CLI, ZCode, and Hermes Agent own their authentication; sign in using their official
+Antigravity, Grok Build, Devin CLI, Cursor CLI, ZCode, and Hermes Agent own their authentication; sign in using their official
 CLI or extension.
 The optional Z.AI Coding Plan and MiMo Token Plan API keys are stored as separate
 entries in PandaCode's secrets store (see [secret storage](#secret-storage)) and injected only into their isolated Claude subprocesses. The app discovers executable paths
@@ -809,6 +809,98 @@ command, a Plan turn and a live steer). The recorded frames back the unit tests 
 `providers/devin.rs`, and an ignored smoke test
 (`installed_devin_lists_models_with_efforts`) reads the real catalog and command list
 without sending a prompt.
+
+## Cursor CLI
+
+Cursor's Agent CLI (`agent`, with the backward-compatible alias `cursor-agent`) serves
+ACP v1 with `agent acp`, so PandaCode drives it with the shared ACP adapter
+(`providers/cursor.rs` holds its quirks). You install it yourself; PandaCode does not
+install, update, sign in to or sign out of it, and checks no Cursor release feed. It is
+never the editor command `cursor`. Official docs: [CLI](https://cursor.com/docs/cli) and
+[ACP](https://cursor.com/docs/cli/acp).
+
+**Finding it.** A candidate is the PATH command `agent`, then `cursor-agent`, a Settings
+executable override, or a named connection's binary. Each is used only after an ACP
+`initialize` handshake identifies Cursor (the `cursor_login` auth method); a path is
+never trusted for its name, and a file whose name is `cursor` is always rejected. The
+first accepted path is remembered, and model lists and task runs spawn exactly that
+path instead of looking up `agent` again. The check runs in the background, so the
+provider list never waits for it; a run, a model list, a remote or machine start and
+the terminal console wait for it, and re-check once when Cursor was not found, so a CLI
+installed after launch is picked up without a restart. The 6-hour agent-update timer does
+not start Cursor. On Windows the official installer's `agent.cmd` is found on PATH and
+launched as the newest installed version's `node.exe index.js`, never through
+`cmd.exe` or PowerShell; a named connection that points at that same shim is started the
+same way, never as the `.cmd` itself.
+
+**Sign-in.** The CLI keeps its own sign-in: run `agent login`, or set `CURSOR_API_KEY` /
+`CURSOR_AUTH_TOKEN` (the provider environment variables apply). PandaCode adds no login,
+device flow or key card. A task sends ACP `authenticate` with `cursor_login` and waits at
+most 60 seconds; an error or silence stops the run with a message to sign in, never a
+browser wait (`NO_OPEN_BROWSER=1` is set so the CLI prints its login URL instead of
+opening one, and PandaCode does not show it). A CLI that exits while that call is pending
+also reads as signed out, except when it refused the chosen model (“Cannot use this
+model”), which says so. Signing in is not part of installed: an unsigned Cursor stays
+selectable and shows the sign-in message.
+
+**Models.** The picker runs `agent models` on the accepted path (60-second bound, cached
+for five minutes, no ACP session) and lists whatever the account prints; there is no
+built-in catalog and no effort control, because efforts are separate model ids. A signed-out
+list shows the sign-in message; other failures say PandaCode could not read the list and to
+run `agent models` in a terminal. A task passes `--model <id>` before `acp` (not for
+`default`). If the session does not report the chosen model, a status line says so
+instead of silently using another.
+
+**Modes.** Standard, Accept edits and Full access are Cursor's Agent mode (full tools);
+PandaCode never selects Cursor's read-only Ask mode, never passes `--mode=ask`, `--force`,
+`--yolo`, `--auto-review`, `--approve-mcps` or `--trust`, and an unexpected mode id never
+fails a turn. A resumed chat left in Plan or Ask is switched to the advertised Agent mode
+when there is one. Cursor applies file edits without asking in Agent mode, so Accept edits
+matches Standard for those; a single once-allow permission on an edit is approved in
+Accept edits and Full access, and everything else shows the approval card. Approving
+always chooses `allow_once` and denying `reject_once`; the always options are never
+chosen. Plan passes `--mode=plan` before `acp` on every Plan spawn, including a resume,
+and sends one `session/set_mode` (client id 4) when the session advertises a Plan mode
+that is not already current. When no Plan mode is advertised the turn still runs, with a
+status line that Plan was unavailable and the session possibly staying in Agent. Review is
+not offered.
+
+**Plans, questions and todos.** `cursor/create_plan` shows PandaCode's approval card with
+the plan and todos. In Plan the card asks “Accept this plan?” and accepting does not
+implement it: switch the task to Standard, Accept edits or Full access. Elsewhere it asks
+“Implement this plan?”. `cursor/update_todos` fills the todo list. `cursor/ask_question`
+uses the question card (up to 3 questions with up to 20 options each; anything else is
+answered with an error and a status line). `cursor/task` and `cursor/generate_image` get
+an empty success result and no new panel.
+
+**Session.** The first turn creates a session and its id is the task's resume id. Later
+turns use `session/load`, and an id the CLI cannot load fails the turn instead of starting
+a new conversation. Cursor starts cold (no warm start). PandaCode's tools are offered
+over HTTP MCP only when the CLI advertises it; otherwise the run continues without them,
+and no `.cursor/mcp.json` or `cli-config.json` is written. Team workers can use Cursor.
+
+**Commands.** Slash-command discovery does not start a process (it would create a chat),
+but a command list the task session sends is shown in the composer.
+
+**Terminal console.** The console opens only before a task's first turn, with
+`--mode=plan` in Plan and no mode flag otherwise. After the task has run, its ACP session
+is not a chat the console can resume, so the console is refused with that explanation.
+
+**Remote and usage.** A viewer starting Cursor on another computer leaves the
+installed check to that computer. The CLI exposes no usage API, so the usage panel says
+it is not available. No telemetry opt-out is known; Settings → Privacy lists Cursor as
+unknown.
+
+Verified against Cursor Agent CLI `2026.09.15-d2fe57e` on 2026-11-02 and 2026-11-03 by
+driving `agent acp` directly on Windows (initialize, signed-in and signed-out
+`authenticate`, `session/new` and `session/load` with and without `--model`, a prompt
+with an edit, a permission request, cancel, a failed load, Plan and plan accept and
+reject, `cursor/update_todos`, and `agent models` signed in and out). The scrubbed frames
+and a Recorded/Unrecorded list are in `providers/cursor_frames/NOTES.md`; they back the
+unit tests in `providers/cursor.rs`. `cursor/ask_question`, `cursor/task` and
+`cursor/generate_image` were never raised and are covered by tests built from Cursor's
+published schema. An ignored smoke test (`installed_cursor`) reads the real model list
+and creates no chat.
 
 ## ZCode
 

@@ -60,6 +60,7 @@ const COVERAGE: &[Coverage] = &[
     Coverage { provider: "omp", name: "Oh My Pi", status: "unknown", detail: "No verified switch." },
     Coverage { provider: "github-copilot", name: "GitHub Copilot CLI", status: "unknown", detail: "No verified switch." },
     Coverage { provider: "antigravity", name: "Antigravity", status: "unknown", detail: "No verified switch." },
+    Coverage { provider: "cursor", name: "Cursor CLI", status: "unknown", detail: "No verified switch." },
 ];
 
 #[cfg(test)]
@@ -138,7 +139,7 @@ mod tests {
         seen.sort();
         seen.dedup();
         assert_eq!(seen.len(), COVERAGE.len());
-        for id in ["claude", "codex", "kimi", "opencode", "glm", "antigravity", "grok", "mimo", "pi", "deepseek", "commandcode", "cline", "omp", "github-copilot", "muse"] {
+        for id in ["claude", "codex", "kimi", "opencode", "glm", "antigravity", "grok", "mimo", "pi", "deepseek", "commandcode", "cline", "omp", "github-copilot", "muse", "cursor"] {
             assert!(seen.contains(&id), "{id} has no privacy entry");
         }
         assert!(COVERAGE.iter().all(|c| ["off", "manual", "unknown"].contains(&c.status)));

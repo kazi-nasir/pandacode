@@ -1,0 +1,8 @@
+{
+  "lines": 275,
+  "modelLines": 270,
+  "nonModelNonBlank": [
+    "Available models",
+    "Tip: use --model <id> (or /model <id> in interactive mode) to switch. Parameterized models also accept quoted overrides, e.g. --model 'claude-opus-4-8[context=1m,effort=high,fast=false]'."
+  ]
+}

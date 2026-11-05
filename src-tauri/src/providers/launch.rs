@@ -114,6 +114,13 @@ fn resolve(path: &Path, windows: bool) -> Result<Launch, String> {
         .and_then(|name| name.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    if matches!(name.as_str(), "agent" | "cursor-agent")
+        && path
+            .parent()
+            .is_some_and(|directory| directory.join("cursor-agent.ps1").is_file())
+    {
+        return cursor_launch(path, &name, windows);
+    }
     let package =
         match name.as_str() {
             "codex" => "@openai/codex",
@@ -164,6 +171,83 @@ fn resolve(path: &Path, windows: bool) -> Result<Launch, String> {
         });
     }
     node_launch(&script, directory)
+}
+
+const CURSOR_INCOMPLETE: &str = "The Cursor CLI install is incomplete. Reinstall the Cursor CLI.";
+
+type CursorVersionKey = (u32, u32, u32, (u32, u32, u32));
+
+/// Sort key of a Cursor `versions\` directory name, or `None` when the name does not
+/// match `YYYY.M.D[-HH-MM-SS]-<hex>` (the pattern the official `cursor-agent.ps1` uses).
+fn cursor_version_key(name: &str) -> Option<CursorVersionKey> {
+    let number = |text: &str, min: usize, max: usize| {
+        (text.len() >= min && text.len() <= max && text.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| text.parse::<u32>().ok())
+            .flatten()
+    };
+    let mut parts = name.split('-');
+    let mut date = parts.next()?.split('.');
+    let year = number(date.next()?, 4, 4)?;
+    let month = number(date.next()?, 1, 2)?;
+    let day = number(date.next()?, 1, 2)?;
+    if date.next().is_some() {
+        return None;
+    }
+    let rest: Vec<&str> = parts.collect();
+    let (stamp, hash) = match rest.as_slice() {
+        [hash] => ((0, 0, 0), *hash),
+        [h, m, s, hash] => ((number(h, 2, 2)?, number(m, 2, 2)?, number(s, 2, 2)?), *hash),
+        _ => return None,
+    };
+    if hash.is_empty() || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    Some((year, month, day, stamp))
+}
+
+/// The native Windows Cursor install: `node.exe` plus `index.js`, started directly so
+/// no `cmd.exe` or PowerShell ever parses the caller's arguments.
+fn cursor_launch(shim: &Path, stem: &str, windows: bool) -> Result<Launch, String> {
+    let incomplete = || CURSOR_INCOMPLETE.to_string();
+    let install = shim
+        .parent()
+        .and_then(|directory| directory.canonicalize().ok())
+        .ok_or_else(incomplete)?;
+    let beside = (install.join("node.exe").is_file() && install.join("index.js").is_file())
+        .then(|| install.clone());
+    let directory = match beside {
+        Some(directory) => directory,
+        None => std::fs::read_dir(install.join("versions"))
+            .map_err(|_| incomplete())?
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                let key = cursor_version_key(&name)?;
+                Some(((key, name), entry.path()))
+            })
+            .max_by(|a, b| a.0.cmp(&b.0))
+            .map(|(_, path)| path)
+            .ok_or_else(incomplete)?,
+    };
+    let contained = |file: &str| {
+        directory
+            .join(file)
+            .canonicalize()
+            .ok()
+            .filter(|path| path.is_file() && path.starts_with(&install))
+    };
+    let (node, script) = contained("node.exe")
+        .zip(contained("index.js"))
+        .ok_or_else(incomplete)?;
+    Ok(Launch {
+        program: external_path_for(&node, windows),
+        args: vec![external_path_for(&script, windows).into_os_string()],
+        env: Some((
+            "CURSOR_INVOKED_AS",
+            if stem == "agent" { "agent.cmd" } else { "cursor-agent.cmd" },
+        )),
+    })
 }
 
 /// A Node script next to its own runtime, else any node on the searched PATH.
@@ -1062,6 +1146,114 @@ mod tests {
             r#"{"bin":{"codex":"../../outside.js"}}"#,
         );
         assert!(resolve(&shim, true).is_err());
+    }
+
+    fn cursor_install(f: &Fixture, versions: &[&str]) -> PathBuf {
+        f.file("cursor-agent/cursor-agent.ps1", "");
+        f.file("cursor-agent/agent.ps1", "");
+        f.file("cursor-agent/cursor-agent.cmd", "");
+        let shim = f.file("cursor-agent/agent.cmd", "");
+        for version in versions {
+            f.file(&format!("cursor-agent/versions/{version}/node.exe"), "");
+            f.file(&format!("cursor-agent/versions/{version}/index.js"), "");
+        }
+        shim
+    }
+
+    #[test]
+    fn cursor_launch_picks_the_newest_valid_version() {
+        let f = Fixture::new();
+        let shim = cursor_install(
+            &f,
+            &[
+                "2026.09.10-fd3934a",
+                "2026.09.15-d2fe57e",
+                "2026.9.15-10-00-00-aaaa",
+                "2026.09.15-09-00-00-bbbb",
+                "2027.01.01-notes",
+                "2099.01.01-ZZZ",
+            ],
+        );
+        let launch = resolve(&shim, true).unwrap();
+        assert!(launch.program.ends_with("2026.9.15-10-00-00-aaaa/node.exe"));
+        assert_eq!(launch.args.len(), 1);
+        assert!(Path::new(&launch.args[0]).ends_with("2026.9.15-10-00-00-aaaa/index.js"));
+        assert_eq!(launch.env, Some(("CURSOR_INVOKED_AS", "agent.cmd")));
+        let other = f.0.join("cursor-agent/cursor-agent.cmd");
+        assert_eq!(
+            resolve(&other, true).unwrap().env,
+            Some(("CURSOR_INVOKED_AS", "cursor-agent.cmd"))
+        );
+        let launch = resolve(&f.0.join("cursor-agent/AGENT.CMD"), true);
+        if let Ok(launch) = launch {
+            assert_eq!(launch.env, Some(("CURSOR_INVOKED_AS", "agent.cmd")));
+        }
+    }
+
+    #[test]
+    fn cursor_launch_orders_by_date_then_timestamp_then_name() {
+        let key = |name| cursor_version_key(name).unwrap();
+        assert!(key("2026.10.1-aaa") > key("2026.9.30-bbb"));
+        assert!(key("2026.09.15-01-00-00-aaa") > key("2026.09.15-aaa"));
+        assert!(cursor_version_key("2026.09.15").is_none());
+        assert!(cursor_version_key("2026.09.15-1-2-3-abc").is_none());
+        assert!(cursor_version_key("26.09.15-abc").is_none());
+        assert!(cursor_version_key("2026.09.15.1-abc").is_none());
+    }
+
+    #[test]
+    fn cursor_launch_prefers_node_beside_the_shim() {
+        let f = Fixture::new();
+        let shim = cursor_install(&f, &["2026.09.15-d2fe57e"]);
+        f.file("cursor-agent/node.exe", "");
+        f.file("cursor-agent/index.js", "");
+        let launch = resolve(&shim, true).unwrap();
+        assert!(launch.program.ends_with("cursor-agent/node.exe"));
+        assert!(!launch.program.to_string_lossy().contains("versions"));
+    }
+
+    #[test]
+    fn cursor_launch_reports_an_incomplete_install() {
+        for (versions, remove) in [
+            (&[][..], None),
+            (&["not-a-version"][..], None),
+            (&["2026.09.15-d2fe57e"][..], Some("node.exe")),
+            (&["2026.09.15-d2fe57e"][..], Some("index.js")),
+        ] {
+            let f = Fixture::new();
+            let shim = cursor_install(&f, versions);
+            if let Some(file) = remove {
+                fs::remove_file(f.0.join(format!("cursor-agent/versions/2026.09.15-d2fe57e/{file}")))
+                    .unwrap();
+            }
+            let error = resolve(&shim, true).err().unwrap();
+            assert_eq!(error, CURSOR_INCOMPLETE);
+            assert!(!error.contains("node.exe"));
+        }
+    }
+
+    #[test]
+    fn agent_cmd_without_the_cursor_script_keeps_the_unsupported_error() {
+        let f = Fixture::new();
+        let shim = f.file("other/agent.cmd", "");
+        let error = resolve(&shim, true).err().unwrap();
+        assert!(error.contains("unsupported"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_launch_refuses_a_version_outside_the_install() {
+        let f = Fixture::new();
+        let shim = cursor_install(&f, &[]);
+        f.file("elsewhere/node.exe", "");
+        f.file("elsewhere/index.js", "");
+        fs::create_dir_all(f.0.join("cursor-agent/versions")).unwrap();
+        std::os::unix::fs::symlink(
+            f.0.join("elsewhere"),
+            f.0.join("cursor-agent/versions/2026.09.15-d2fe57e"),
+        )
+        .unwrap();
+        assert_eq!(resolve(&shim, true).err().unwrap(), CURSOR_INCOMPLETE);
     }
 
     #[test]

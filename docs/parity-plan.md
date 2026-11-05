@@ -69,4 +69,4 @@ A triage of a long competitor feature list (October 2026) against PandaCode. Eac
 
 ## Skip
 
-Mobile clients and mobile-only behavior; Pi and Cursor SDK integrations; Devin; the ACP agent registry and checksum onboarding; OpenCode 2 server runtime; multi-client synchronization, client and server version negotiation, and the separate v2 database migration. These depend on harnesses or a client and server split that PandaCode does not have. They can be revisited if those harnesses are added.
+Mobile clients and mobile-only behavior; Pi and Cursor SDK integrations (the Cursor CLI is a shipped harness, driven over ACP; the Cursor SDK and `agent worker` stay skipped); Devin; the ACP agent registry and checksum onboarding; OpenCode 2 server runtime; multi-client synchronization, client and server version negotiation, and the separate v2 database migration. These depend on harnesses or a client and server split that PandaCode does not have. They can be revisited if those harnesses are added.

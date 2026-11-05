@@ -1,0 +1,35 @@
+Available models
+
+auto - Auto (current, default)
+gpt-5.3-codex-low - Codex 5.3 Low
+gpt-5.3-codex-low-fast - Codex 5.3 Low Fast
+gpt-5.3-codex - Codex 5.3
+gpt-5.3-codex-fast - Codex 5.3 Fast
+gpt-5.3-codex-high - Codex 5.3 High
+claude-fable-5-thinking-high - Claude Fable 5 1M Thinking (NO ZDR)
+claude-fable-5-thinking-xhigh - Claude Fable 5 1M Extra High Thinking (NO ZDR)
+grok-4.7-low-fast - Grok 4.7  Low Fast​​
+grok-4.7-medium-fast - Grok 4.7  Medium Fast​​
+grok-4.7-high-fast - Grok 4.7  High Fast​​
+grok-4.7-xhigh-fast - Grok 4.7  Extra High Fast​​
+claude-fable-5-1-low - Claude Fable 5.1 1M Low (NO ZDR)
+claude-fable-5-1-medium - Claude Fable 5.1 1M Medium (NO ZDR)
+claude-fable-5-1-high - Claude Fable 5.1 1M (NO ZDR)
+claude-fable-5-1-xhigh - Claude Fable 5.1 1M Extra High (NO ZDR)
+claude-fable-5-1-max - Claude Fable 5.1 1M Max (NO ZDR)
+claude-fable-5-1-thinking-low - Claude Fable 5.1 1M Low Thinking (NO ZDR)
+claude-fable-5-1-thinking-medium - Claude Fable 5.1 1M Medium Thinking (NO ZDR)
+claude-fable-5-1-thinking-high - Claude Fable 5.1 1M Thinking (NO ZDR)
+claude-fable-5-1-thinking-xhigh - Claude Fable 5.1 1M Extra High Thinking (NO ZDR)
+claude-fable-5-1-thinking-max - Claude Fable 5.1 1M Max Thinking (NO ZDR)
+claude-fable-5-low - Claude Fable 5 1M Low (NO ZDR)
+claude-fable-5-medium - Claude Fable 5 1M Medium (NO ZDR)
+claude-fable-5-high - Claude Fable 5 1M (NO ZDR)
+claude-fable-5-xhigh - Claude Fable 5 1M Extra High (NO ZDR)
+claude-fable-5-max - Claude Fable 5 1M Max (NO ZDR)
+claude-fable-5-thinking-low - Claude Fable 5 1M Low Thinking (NO ZDR)
+claude-fable-5-thinking-medium - Claude Fable 5 1M Medium Thinking (NO ZDR)
+claude-fable-5-thinking-max - Claude Fable 5 1M Max Thinking (NO ZDR)
+deepseek-v41-flash-1017-max - DeepSeek V4.1 Flash 1017 Max
+
+Tip: use --model <id> (or /model <id> in interactive mode) to switch. Parameterized models also accept quoted overrides, e.g. --model 'claude-opus-4-8[context=1m,effort=high,fast=false]'.

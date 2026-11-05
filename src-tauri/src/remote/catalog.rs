@@ -55,7 +55,9 @@ impl Cache {
     fn check(&self, device: &str, name: &str, provider: &str, model: &str, now: Instant) -> Result<()> {
         if let Some(list) = self.get(&(device.into(), None), now, None) {
             let found = list.as_array().into_iter().flatten().find(|p| p["id"] == provider);
-            if !found.is_some_and(|p| p["installed"] == true) {
+            // A host's first list may only mean its Cursor probe has not settled; its own
+            // `require_installed` waits for the probe and decides.
+            if provider != "cursor" && !found.is_some_and(|p| p["installed"] == true) {
                 let label = found.and_then(|p| p["name"].as_str()).unwrap_or(provider);
                 return Err(format!("{label} is not installed on {name}."));
             }
@@ -190,6 +192,21 @@ mod tests {
         assert_eq!(cache.check("studio", "Studio", "claude", "opus-9", now), Err("opus-9 is not available for claude on Studio.".into()));
         assert_eq!(cache.check("studio", "Studio", "codex", "gpt", now), Err("Codex is not installed on Studio.".into()));
         assert_eq!(cache.check("studio", "Studio", "kimi", "k2", now), Err("kimi is not installed on Studio.".into()));
+    }
+
+    #[test]
+    fn a_cached_cursor_not_installed_is_left_to_the_host() {
+        let mut cache = Cache::default();
+        let now = Instant::now();
+        cache.put(key(None), now, json!([{"id": "cursor", "name": "Cursor CLI", "installed": false}, {"id": "codex", "name": "Codex", "installed": false}]));
+        assert_eq!(cache.check("studio", "Studio", "cursor", "default", now), Ok(()));
+        assert_eq!(cache.check("studio", "Studio", "codex", "default", now), Err("Codex is not installed on Studio.".into()));
+        cache.put(key(Some("cursor")), now, json!([{"id": "default"}]));
+        assert_eq!(cache.check("studio", "Studio", "cursor", "gone", now), Err("gone is not available for cursor on Studio.".into()));
+        // A host list with no `cursor` row at all is left to the host too.
+        cache.put(key(None), now, json!([{"id": "claude", "name": "Claude Code", "installed": true}]));
+        assert_eq!(cache.check("studio", "Studio", "cursor", "default", now), Ok(()));
+        assert_eq!(cache.check("studio", "Studio", "cursor", "gone", now), Err("gone is not available for cursor on Studio.".into()));
     }
 
     #[test]

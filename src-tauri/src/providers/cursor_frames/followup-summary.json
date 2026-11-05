@@ -1,0 +1,106 @@
+{
+  "plan": {
+    "handshake": {
+      "initOk": true,
+      "authOk": true,
+      "authError": null
+    },
+    "loadError": null,
+    "before": {
+      "currentModeId": "agent",
+      "available": [
+        "agent",
+        "plan",
+        "ask"
+      ],
+      "optionValue": "agent"
+    },
+    "setMode": {
+      "ok": true,
+      "error": null,
+      "modeUpdates": [
+        "plan"
+      ]
+    },
+    "edit": {
+      "prompt": "Edit hello.txt so its entire contents are the single word bye. Use your file editing tool. Do not run any shell command.",
+      "stop": "end_turn",
+      "permissions": [],
+      "edits": 0,
+      "editCompleted": false,
+      "text": "I will edit hello.txt to contain only the word \"bye\".\n\nPlan mode requires a plan before any edits. I will create a simple plan and wait for confirmation.Plan mode is on, so I'll confirm the file and draft a short plan—no edits until you approve.This is a single trivial file edit. No parallelization or red-teaming applies.Trivial one-file change — drafting the plan directly.",
+      "modeUpdates": [
+        "plan"
+      ]
+    },
+    "raised": {
+      "question": {
+        "prompt": "Use your question tool to ask me exactly one multiple-choice question before any other action. The question id is greeting, the prompt is Which word should the greeting file contain?, and the options are hi and hello. Do not edit files, do not run commands, and do not write a plan.",
+        "stop": "end_turn",
+        "methods": [],
+        "permissions": [],
+        "modeUpdates": [],
+        "configUpdates": [],
+        "text": "I will ask the user a multiple-choice question about which word should go in the greeting file.\n\nI cannot find an AskQuestion tool in the static list. I am checking the dynamic tools for one.Looking up the question tool schema, then asking your one multiple-choice question.The AskQuestion tool is unavailable.I don’t have a dedicated question/AskUser tool in this session, so here’s the same multipl"
+      },
+      "plan": {
+        "prompt": "Use your plan tool to request approval of a plan named Greeting. The plan markdown must be the single line Write hello.txt. Include one pending todo with content Write hello.txt. Do not edit files and do not run commands.",
+        "stop": "end_turn",
+        "methods": [
+          "cursor/create_plan"
+        ],
+        "permissions": [],
+        "modeUpdates": [],
+        "configUpdates": [],
+        "text": "Preparing to request approval for a Greeting plan via CreatePlan. The plan will contain the single line \"Write hello.txt\" as both its markdown and a pending todo.\n\nCreatePlan requires a level 1 markdown heading as the first line of the plan. The user's single-line instruction conflicts with this requirement."
+      },
+      "todos": {
+        "prompt": "Use your todo tool to replace the todo list with one pending todo whose content is record shapes. Do not edit files and do not run commands.",
+        "stop": "end_turn",
+        "methods": [
+          "cursor/update_todos"
+        ],
+        "permissions": [],
+        "modeUpdates": [],
+        "configUpdates": [],
+        "text": "I will use the TodoWrite tool to replace the todo list with one pending item: \"record shapes\".The schema requires at least two todos.Replacing the todo list with a single pending item via the todo tool.The todo list was replaced with one pending task: \"record shapes\".Replaced the todo list with one pending item: **record shapes**."
+      }
+    }
+  },
+  "model": {
+    "handshake": {
+      "initOk": true,
+      "authOk": true,
+      "authError": null
+    },
+    "loadError": null,
+    "currentModelId": "composer-2.5[fast=true]",
+    "optionValue": "composer-2.5[fast=true]",
+    "composerValue": "composer-2.5[fast=true]",
+    "flagMatched": true,
+    "selected": null
+  },
+  "mcp": {
+    "handshake": {
+      "initOk": true,
+      "authOk": true,
+      "authError": null
+    },
+    "loadError": null,
+    "duringLoad": {
+      "permissions": [],
+      "hits": 1
+    },
+    "prompt": "List the tool names exposed by the MCP server named pandacode_recording. Do not edit files and do not run shell commands.",
+    "stop": "end_turn",
+    "permissions": [],
+    "text": "I need to list the tool names exposed by the MCP server named pandacode_recording.No MCP server named pandacode_recording was found.The MCP server \"pandacode_recording\" is not present in the dynamic tools catalog.No references to the pandacode_recording MCP server were found in the workspaceThe MCP server **`pandacode_recording`** is not available in this session, so there are no tool names to lis",
+    "hits": [
+      {
+        "method": "POST",
+        "url": "/mcp",
+        "auth": true
+      }
+    ]
+  }
+}

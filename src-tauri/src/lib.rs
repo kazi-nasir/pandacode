@@ -2340,9 +2340,16 @@ async fn launch_operation_admitted(
         let mut successful = result.is_ok() && !was_stopped;
         // Only the harness's own outcome counts for model health (Settings → Model routing): a stop
         // says nothing, and PandaCode's own failures before the harness (validation, attachments,
-        // connections, team tools) are not the model's.
+        // connections, team tools) are not the model's. Nor is a Cursor sign-in failure: the
+        // provider stays installed, so it must not pause the model for routing and failover.
         let provider_error = match &result {
-            Err(error) if !was_stopped && reached_harness.load(Ordering::SeqCst) => Some(error.to_string()),
+            Err(error)
+                if !was_stopped
+                    && reached_harness.load(Ordering::SeqCst)
+                    && !(ran.0 == "cursor" && providers::cursor::is_sign_in_error(error)) =>
+            {
+                Some(error.to_string())
+            }
             _ => None,
         };
         if let Some(error) = &provider_error {
@@ -2622,6 +2629,8 @@ pub(crate) async fn local_providers(force: bool) -> Vec<providers::ProviderInfo>
         providers::acp_catalog::invalidate("devin");
         providers::acp_catalog::invalidate("zcode");
         providers::acp_catalog::invalidate("hermes");
+        providers::acp_catalog::invalidate("cursor");
+        providers::cursor::refresh().await;
     }
     tauri::async_runtime::spawn_blocking(providers::discover)
         .await
@@ -3731,6 +3740,10 @@ fn setup_common(app: &tauri::App) -> crate::Result<PathBuf> {
     connections::setup(&dir)?;
     model_routing::setup(&dir);
     model_health::setup(&dir);
+    let settled = app.handle().clone();
+    providers::cursor::on_settled(move || {
+        let _ = settled.emit("providers-changed", serde_json::json!({"provider": "cursor"}));
+    });
     // Optional integration storage must never prevent the workspace from opening.
     if jev::setup(&dir).is_err() {
         eprintln!("Jev settings are unavailable; browser testing remains disabled.");

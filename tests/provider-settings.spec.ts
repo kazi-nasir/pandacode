@@ -262,7 +262,7 @@ test('provider connections expose all harnesses and real GLM model names', async
   await expect(page.getByText('GLM-5.3', { exact: true }).first()).toBeVisible();
 });
 
-for (const providerId of ['claude', 'codex', 'kimi', 'opencode', 'glm', 'antigravity', 'grok', 'mimo', 'pi', 'deepseek', 'commandcode', 'cline', 'kilo', 'omp', 'github-copilot', 'muse', 'devin', 'zcode', 'hermes']) {
+for (const providerId of ['claude', 'codex', 'kimi', 'opencode', 'glm', 'antigravity', 'grok', 'mimo', 'pi', 'deepseek', 'commandcode', 'cline', 'kilo', 'omp', 'github-copilot', 'muse', 'devin', 'zcode', 'hermes', 'cursor']) {
   test(`provider connections start ${providerId} tasks with Full access and retain explicit restrictions when switching`, async ({ page }) => {
     await page.addInitScript(provider => localStorage.setItem('pandacode.provider', provider), providerId);
     await page.route('**/src/preview.ts*', async route => {
@@ -526,3 +526,46 @@ test('Hermes Agent has an install card, four approval modes, and executable sett
   await expect(card.getByLabel('Hermes Agent executable', { exact: true })).toBeVisible();
 });
 
+test('Cursor CLI has an install and sign-in card, four approval modes, a closed model list, and no key field', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('pandacode.defaultProvider', 'cursor');
+    localStorage.setItem('pandacode.provider', 'cursor');
+  });
+  await page.goto('/');
+  await page.locator('.new-task-button').click();
+  await expect(page.locator('.new-task-welcome')).toBeVisible();
+  await expect(page.locator('#model-picker-trigger .provider-logo[data-provider="cursor"]')).toBeVisible();
+  await page.locator('#mode-picker-trigger').click();
+  const items = page.getByRole('dialog', { name: 'Permissions', exact: true }).getByRole('menuitemradio');
+  await expect(items).toHaveCount(4);
+  await expect(items.filter({ hasText: 'Accept edits' })).toHaveCount(1);
+  await expect(items.filter({ hasText: 'Plan mode' })).toHaveCount(1);
+  // No Cursor mode description says tools run without approval prompts.
+  await expect(items.filter({ hasText: /without (asking|approval)/i })).toHaveCount(0);
+  await page.keyboard.press('Escape');
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.getByRole('region', { name: 'Settings', exact: true }).getByRole('tab', { name: 'Providers', exact: true }).click();
+  const card = page.locator('.connection-card').filter({ has: page.getByRole('heading', { name: 'Cursor CLI', exact: false }) });
+  await expect(card).toContainText('agent login');
+  await expect(card).toContainText('CURSOR_API_KEY');
+  await expect(card).toContainText('CURSOR_AUTH_TOKEN');
+  await expect(card.getByRole('link', { name: 'Install and sign in' })).toHaveAttribute('href', 'https://cursor.com/docs/cli/installation');
+  await expect(card.getByRole('link', { name: 'ACP details' })).toHaveAttribute('href', 'https://cursor.com/docs/cli/acp');
+  await card.locator('details.connection-path > summary').click();
+  await expect(card.getByLabel('Cursor CLI executable', { exact: true })).toBeVisible();
+  // The CLI keeps its own sign-in: PandaCode has no key field for it.
+  await expect(card.locator('input[type="password"]')).toHaveCount(0);
+});
+
+
+test('providers-changed refreshes Settings in place without a forced rescan', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await expect(page.locator('.provider-diagnostic').first()).toBeVisible();
+  const forced = () => page.evaluate(() => (window as any).__forcedProviderLists ?? 0);
+  const before = await forced();
+  await page.evaluate(() => (window as any).__previewEmit('providers-changed', { provider: 'cursor' }));
+  await page.waitForTimeout(300);
+  await expect(page.locator('.provider-diagnostic').first()).toBeVisible();
+  expect(await forced()).toBe(before);
+});

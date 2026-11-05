@@ -3,7 +3,7 @@
  * site actually do; change this page with them. */
 import Page from '../layouts/Page.astro';
 import { project } from '../lib/distribution';
-const updated = { iso: '2026-10-26', label: 'October 26, 2026' };
+const updated = { iso: '2026-11-03', label: 'November 3, 2026' };
 const sections = [
   ['overview', 'The short version'],
   ['app', 'The desktop app'],
@@ -81,7 +81,8 @@ const sections = [
         <h2 id="providers-title">Services you choose</h2>
         <p>PandaCode is a workspace for tools you bring. When you use one, the app sends it what the work needs, directly from your computer, under your own account with that service and its privacy policy.</p>
         <ul>
-          <li><strong>Coding agents and model providers</strong>, such as Claude Code, Codex, Kimi Code, OpenCode, Antigravity, Grok, Devin, Hermes, GLM and MiMo, receive your prompts, the files and context they read, attachments and tool output.</li>
+          <li><strong>Coding agents and model providers</strong>, such as Claude Code, Codex, Kimi Code, OpenCode, Antigravity, Grok, Devin, Cursor CLI, Hermes, GLM and MiMo, receive your prompts, the files and context they read, attachments and tool output.</li>
+          <li><strong>Cursor CLI checks.</strong> PandaCode itself makes no request to Cursor and checks no Cursor release feed; it starts the Cursor CLI on your computer, and that program may contact Cursor under your Cursor account or update itself. The first provider list of each launch starts the program first on your PATH named <code>agent</code> (then <code>cursor-agent</code>) with the argument <code>acp</code> and sends one <code>initialize</code> message, before PandaCode knows it is Cursor, so an unrelated program with that name is started once per launch, and again once per Cursor run, model list or start attempted while Cursor is not found; it is accepted only if its reply identifies Cursor. That first list does not run <code>--version</code>. After a verdict is stored, the next provider list runs <code>--version</code> once and the string is kept for the running app; Refresh runs it once more. <code>agent models</code> runs when Cursor’s model list is loaded (the model picker, or opening a Cursor task); a successful list is reused for 5 minutes unless you press Refresh, and a failed one runs again on the next load. The agent version check that runs about every 6 hours does not start the Cursor CLI.</li>
           <li><strong>GitHub</strong>, through the <code>gh</code> command-line tool you sign in to, when you link pull requests or use GitHub features.</li>
           <li><strong>Bots</strong> run on your computer. Messages you exchange through Telegram, Slack, Discord or WhatsApp pass through those platforms. Web chat is served from your own computer.</li>
           <li><strong>Virtual machines and cloud sandboxes.</strong> Local VMs run on your Mac. Daytona, Cloudflare and AWS sandboxes run in your own accounts and receive the commands, files and screen interactions you or your agents send.</li>

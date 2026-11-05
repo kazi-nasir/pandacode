@@ -36,6 +36,7 @@ mod codex_stream_tests;
 pub(crate) mod concurrent_process_tests;
 mod cline;
 mod commandcode;
+pub(crate) mod cursor;
 mod extra_models;
 mod github_copilot;
 mod devin;
@@ -92,7 +93,7 @@ const PREVIEW_TRUNCATED: &str = "\n[Preview truncated]";
 fn should_shrink(len: usize, capacity: usize) -> bool {
     capacity > 1024 * 1024 && len <= FRAME_KEEP / 2
 }
-pub(crate) const PROVIDERS: [(&str, &str); 19] = [
+pub(crate) const PROVIDERS: [(&str, &str); 20] = [
     ("claude", "Claude Code"),
     ("codex", "Codex"),
     ("kimi", "Kimi Code"),
@@ -112,6 +113,7 @@ pub(crate) const PROVIDERS: [(&str, &str); 19] = [
     ("devin", "Devin CLI"),
     ("zcode", "ZCode"),
     ("hermes", "Hermes Agent"),
+    ("cursor", "Cursor CLI"),
 ];
 
 /// Claude Code tools that only report back to a session that stays open after its turn.
@@ -541,7 +543,7 @@ pub fn validate_reasoning_effort(provider: &str, effort: Option<&str>) -> Result
     let valid = match (provider, effort) {
         (
             "claude" | "codex" | "kimi" | "glm" | "opencode" | "antigravity" | "grok" | "mimo"
-            | "pi" | "deepseek" | "commandcode" | "cline" | "kilo" | "omp" | "github-copilot" | "muse" | "devin" | "zcode" | "hermes",
+            | "pi" | "deepseek" | "commandcode" | "cline" | "kilo" | "omp" | "github-copilot" | "muse" | "devin" | "zcode" | "hermes" | "cursor",
             None,
         ) => true,
         ("claude" | "glm" | "mimo", Some(value)) => {
@@ -595,6 +597,15 @@ impl ModelInfo {
 }
 
 pub(crate) fn executable(name: &str) -> Option<PathBuf> {
+    if name == "cursor" {
+        // Only a handshake that identifies Cursor makes a program installed, and a read
+        // here never waits for it: a miss starts the background probe (see `cursor.rs`).
+        let cached = cursor::cached_installed();
+        if cached.is_none() {
+            cursor::ensure_probe();
+        }
+        return cached;
+    }
     if let Some(path) = crate::provider_settings::executable_override(name) {
         return Some(path);
     }
@@ -748,6 +759,9 @@ pub fn discover() -> Vec<ProviderInfo> {
             installed: path.is_some(),
             version: if id == "antigravity" {
                 "ACP".into()
+            } else if id == "cursor" {
+                // Read once per verdict; the first list has no path yet and spawns nothing.
+                path.as_deref().map(|path| cursor::version(path, version)).unwrap_or_default()
             } else {
                 path.as_deref().and_then(version).unwrap_or_default()
             },
@@ -933,7 +947,7 @@ pub(crate) async fn list_model_catalog(provider: &str) -> Result<Vec<ModelInfo>,
     let semaphore = &model_discovery_semaphores()[index];
     let _permit = if matches!(
         provider,
-        "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "muse" | "devin" | "zcode" | "hermes"
+        "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "muse" | "devin" | "zcode" | "hermes" | "cursor"
     ) {
         // Saving models refreshes both windows. Queue their bounded metadata
         // queries so one window does not cache incomplete ID-only fallbacks.
@@ -946,6 +960,12 @@ pub(crate) async fn list_model_catalog(provider: &str) -> Result<Vec<ModelInfo>,
             .try_acquire()
             .map_err(|_| "Model discovery is already running".to_owned())?
     };
+    if provider == "cursor" {
+        // A cold or negative cache is not "not installed": wait for the probe, then list
+        // models on the exact program it accepted (no second PATH lookup).
+        let path = cursor::accepted_executable().await.ok_or("Provider CLI is not installed or is not on PATH")?;
+        return cursor::models(&path).await;
+    }
     let path = executable(provider).ok_or("Provider CLI is not installed or is not on PATH")?;
     match provider {
         "claude" => claude_models(&path).await,
@@ -1308,6 +1328,8 @@ struct Protocol {
     pi: pi::State,
     muse: muse::State,
     zcode: zcode::State,
+    /// Last merged `cursor/update_todos` list for the run (each item keeps `id`, `content`, `status`).
+    cursor_todos: Value,
     // ACP may publish commands before session/new responds. Keep at most one
     // small frame until the response confirms which session owns it.
     early_kimi_commands: Option<Vec<u8>>,
@@ -1438,6 +1460,7 @@ impl Protocol {
             pi: pi::State::default(),
             muse: muse::State::default(),
             zcode: zcode::State::default(),
+            cursor_todos: json!([]),
             early_kimi_commands: None,
             tools: HashMap::new(),
             file_write_tools: HashSet::new(),
@@ -1898,7 +1921,7 @@ impl Protocol {
                     json!({"experimentalApi":true,"requestAttestation":false});
                 request
             }
-            "kimi" | "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "devin" | "hermes" => {
+            "kimi" | "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "devin" | "hermes" | "cursor" => {
                 json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"pandacode","version":"0.1.0"}}})
             }
             _ => {
@@ -1939,6 +1962,7 @@ impl Protocol {
                 json!({"id":request["id"],"result":result})
             }
             "devin" => devin::decision(&request, approved),
+            "cursor" => cursor::approve_reply(&request, approved),
             "kimi" | "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "hermes" => {
                 let options = request["params"]["options"].as_array();
                 let kinds = if approved {
@@ -1967,7 +1991,7 @@ impl Protocol {
             "codex" => {
                 json!({"id":900,"method":"turn/interrupt","params":{"threadId":self.remote_id,"turnId":self.turn_id}})
             }
-            "kimi" | "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "devin" | "hermes" => {
+            "kimi" | "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "devin" | "hermes" | "cursor" => {
                 json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":self.remote_id}})
             }
             _ => {
@@ -1998,7 +2022,7 @@ impl Protocol {
             "pi" | "omp" => self.pi(value).map(|step| self.steered(step)),
             "zcode" => self.zcode(value).map(|step| self.steered(step)),
             "muse" => self.muse(value),
-            "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "devin" | "hermes" => self.acp(value),
+            "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "devin" | "hermes" | "cursor" => self.acp(value),
             _ => self.claude(value),
         }
     }
@@ -3112,6 +3136,11 @@ fn configure_command(command: &mut Command, config: &RunConfig) {
         "muse" => muse::configure(command, config),
         "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" => acp::configure(command, config),
         "github-copilot" | "devin" | "hermes" => acp::configure(command, config),
+        "cursor" => {
+            // Cloud runs have no connection arguments; `run_inner` builds a local run itself.
+            cursor::configure(command, config);
+            command.arg("acp");
+        }
         "kimi" => {
             if use_model {
                 command.args(["--model", &config.model]);
@@ -3195,6 +3224,7 @@ async fn run_inner(
         "devin",
         "zcode",
         "hermes",
+        "cursor",
     ]
     .contains(&config.provider.as_str())
     {
@@ -3213,21 +3243,61 @@ async fn run_inner(
     let mut connection = crate::connections::for_task(&config.session_id, &config.provider)
         .map(|connection| crate::connections::launch(&connection))
         .transpose()?;
-    let path = connection
-        .as_ref()
-        .and_then(|connection| connection.executable.clone())
-        .or_else(|| executable(&config.provider))
-        .ok_or_else(|| {
+    let cursor_run = config.provider == "cursor";
+    let path = if cursor_run {
+        // Only a program whose handshake identified Cursor runs; a cold or negative cache
+        // waits for a probe instead of failing as "not installed".
+        let named = connection.as_ref().and_then(|connection| connection.executable.clone());
+        let path = match named {
+            Some(named) => {
+                let env = connection.as_ref().map(|connection| connection.env.as_slice()).unwrap_or_default();
+                if let Err(error) = cursor::accept_path(&named, env).await {
+                    return Err(connection.as_ref().map_or(error.clone(), |connection| connection.redact(&error)));
+                }
+                Some(named)
+            }
+            None => match cursor::accepted_executable().await {
+                Some(path) if !path.exists() => {
+                    cursor::invalidate_handshake();
+                    cursor::accepted_executable().await
+                }
+                found => found,
+            },
+        };
+        path.ok_or_else(|| {
             reached_harness();
             format!("{} CLI is not installed or is not on PATH", config.provider)
-        })?;
+        })?
+    } else {
+        connection
+            .as_ref()
+            .and_then(|connection| connection.executable.clone())
+            .or_else(|| executable(&config.provider))
+            .ok_or_else(|| {
+                reached_harness();
+                format!("{} CLI is not installed or is not on PATH", config.provider)
+            })?
+    };
     config.cwd = external_path(&config.cwd);
     let image_blocks = attachments::load(&config.provider, &config.images).await?;
     let mut command = provider_command(&config.provider, &path)?;
-    configure_command(&mut command, &config);
-    // A named connection's arguments and environment win over the global setup.
-    if let Some(connection) = &connection {
-        connection.apply(&mut command);
+    if cursor_run {
+        // Cursor's flags, then the connection's allowed arguments once, then `acp` last;
+        // `spawn_arguments` builds that exact argv. `Launch::apply` would append the
+        // arguments after `acp`, so only the connection's environment is applied here.
+        claude_auth::configure(&mut command, &config.provider);
+        command.args(cursor::spawn_arguments(&config, connection.as_ref().map(|connection| connection.args.as_slice()).unwrap_or_default())?);
+        if let Some(connection) = &connection {
+            command.envs(connection.env.iter().map(|(key, value)| (key, value)));
+        }
+        // Last, so a connection's variables cannot drop it.
+        command.env(cursor::NO_OPEN_BROWSER, "1");
+    } else {
+        configure_command(&mut command, &config);
+        // A named connection's arguments and environment win over the global setup.
+        if let Some(connection) = &connection {
+            connection.apply(&mut command);
+        }
     }
     if config.provider == "kilo" {
         let inline = kilo::configure_environment(&mut command, &config);
@@ -3380,7 +3450,7 @@ async fn run_process_with_tools(
         }
         (
             "claude" | "glm" | "mimo" | "kimi" | "opencode" | "antigravity" | "grok" | "pi"
-            | "deepseek" | "commandcode" | "cline" | "kilo" | "omp" | "github-copilot" | "muse" | "devin" | "hermes",
+            | "deepseek" | "commandcode" | "cline" | "kilo" | "omp" | "github-copilot" | "muse" | "devin" | "hermes" | "cursor",
             Some(host),
         ) => (
             None,
@@ -3456,6 +3526,9 @@ async fn run_process_with_tools(
     let step_limit = startup_step();
     let mut deadline = startup_deadline(started, started, step_limit);
     let mut answered = false;
+    // Cursor only: armed once `authenticate` is written, disarmed by its response.
+    let mut auth = cursor::AuthWatch::for_provider(&protocol.config.provider);
+    let mut auth_exited = false;
     let result=async {
         write_json(&mut stdin,&protocol.initial()).await?;
         if protocol.config.provider == "antigravity" {
@@ -3470,7 +3543,7 @@ async fn run_process_with_tools(
                         Some(RunInput::Steer{id,text,reply})=>{let step=protocol.steer(id,text,reply);apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await?;},
                         Some(RunInput::Approval{request_id,approved})=>{if !mcp.as_ref().is_some_and(|server|server.approve(&request_id,approved)) {let step=protocol.approval_step(&request_id,approved); apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await?;}},
                         Some(RunInput::UserInput{request_id,response,reply})=>{
-                            match if protocol.config.provider=="muse" {protocol.muse_user_input(&request_id,response)} else {protocol.user_input(&request_id,response)} {
+                            match match protocol.config.provider.as_str() {"muse"=>protocol.muse_user_input(&request_id,response),"cursor"=>protocol.cursor_user_input(&request_id,response),_=>protocol.user_input(&request_id,response)} {
                                 Ok(step)=>{let result=apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await.map(|_|());if let Some(reply)=reply {let _=reply.send(result.clone());}result?;},
                                 Err(error)=>{if let Some(reply)=reply {let _=reply.send(Err(error));}},
                             }
@@ -3504,6 +3577,9 @@ async fn run_process_with_tools(
                 _=tokio::time::sleep_until(deadline),if stopped || protocol.phase==0=>{
                     if stopped{break Ok(());}break Err(startup_timeout_error(started.elapsed(),answered));
                 },
+                _=tokio::time::sleep_until(auth.deadline().unwrap_or_else(||tokio::time::Instant::now()+Duration::from_secs(86400))),if !stopped && auth.armed()=>{
+                    break Err(cursor::SIGN_IN_ERROR.into());
+                },
                 _=tokio::time::sleep_until(protocol.approval_deadline().unwrap_or_else(||tokio::time::Instant::now()+Duration::from_secs(86400))),if !stopped && protocol.approval_deadline().is_some()=>{
                     let step=protocol.expire_approvals(tokio::time::Instant::now());
                     apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await?;
@@ -3514,7 +3590,11 @@ async fn run_process_with_tools(
                 },
                 read=stdout.read(&mut buf)=>{
                     let count=read.map_err(|e|format!("Provider stream failed: {e}"))?;
-                    if count==0 {if stopped{break Ok(());}break Err("Agent exited before completing its response".into());}
+                    if count==0 {
+                        if stopped{break Ok(());}
+                        if auth.armed() {auth_exited=true;break Err(cursor::SIGN_IN_ERROR.into());}
+                        break Err("Agent exited before completing its response".into());
+                    }
                     // Retained bytes contain no newline: only scan this read.
                     // Rescanning the entire partial frame makes large tool
                     // results quadratic and can starve other concurrent runs.
@@ -3527,14 +3607,21 @@ async fn run_process_with_tools(
                         let line=&bytes[consumed..end];consumed=end+1;
                         if line.len()>MAX_FRAME{return Err("Provider sent an oversized JSON message".into());}
                         if line.iter().all(u8::is_ascii_whitespace){continue;}
-                        let value:Value=serde_json::from_slice(line).map_err(|e|format!("Invalid provider JSON: {e}"))?;
+                        let value:Value=match serde_json::from_slice(line) {
+                            Ok(value)=>value,
+                            // Before `authenticate` is answered a line may be a login URL; drop it unread.
+                            Err(_) if auth.armed()=>continue,
+                            Err(e)=>return Err(format!("Invalid provider JSON: {e}")),
+                        };
                         if stopped {
                             if pi::stop_settled(&protocol.config.provider, &value) {return Ok(());}
                             continue;
                         }
                         answered=true;
                         if protocol.phase==0 {deadline=startup_deadline(started,tokio::time::Instant::now(),step_limit);}
+                        auth.received(&value);
                         let step=protocol.receive(value)?;
+                        auth.written(&step.write,tokio::time::Instant::now());
                         if apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await? {return Ok(());}
                     }
                     bytes.drain(..consumed);
@@ -3571,6 +3658,13 @@ async fn run_process_with_tools(
         .map(|server| server.redact(&diagnostic))
         .unwrap_or(diagnostic);
     result.map_err(|error: String| {
+        // Cursor's own sentences stand alone: stderr may hold a login URL or the account's models.
+        if auth_exited {
+            return cursor::auth_exit(&diagnostic);
+        }
+        if cursor::is_own_error(&error) {
+            return error;
+        }
         let error = mcp
             .as_ref()
             .map(|server| server.redact(&error))
@@ -5133,6 +5227,116 @@ read -r a; echo '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}
         let run = run_script("opencode", "startup-stalled", stalls, Path::new("/dev/null"));
         let error = TEST_STARTUP_STEP.scope(Duration::from_millis(300), run).await.unwrap_err();
         assert!(error.contains("stopped answering"), "{error}");
+    }
+
+    /// A Cursor stand-in: answers `initialize`, reads the `authenticate` request, then runs `$after`.
+    #[cfg(unix)]
+    fn cursor_auth_agent(after: &str) -> String {
+        format!(
+            r#"read -r a; echo '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}'
+read -r a
+{after}"#
+        )
+    }
+
+    /// Runs `script` as the `cursor` provider with the `authenticate` wait cut to 300 ms.
+    #[cfg(unix)]
+    async fn run_cursor_script(id: &str, script: &str, marker: &Path) -> Result<(), String> {
+        let run = run_script("cursor", id, script, marker);
+        cursor::TEST_AUTH_DEADLINE.scope(Duration::from_millis(300), run).await
+    }
+
+    /// The stderr text of the recorded unknown `--model` exit (`model-unknown-load.jsonl`).
+    #[cfg(unix)]
+    fn recorded_model_stderr() -> String {
+        include_str!("providers/cursor_frames/model-unknown-load.jsonl")
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|frame| frame["dir"] == "stderr")
+            .filter_map(|frame| frame["text"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cursor_auth_deadline_silence() {
+        let _serial = concurrent_process_tests::process_test_lock().lock().await;
+        let silent = cursor_auth_agent("exec sleep 30");
+        let error = run_cursor_script("cursor-auth-silence", &silent, Path::new("/dev/null")).await.unwrap_err();
+        assert_eq!(error, cursor::SIGN_IN_ERROR);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cursor_auth_deadline_id7_request() {
+        let _serial = concurrent_process_tests::process_test_lock().lock().await;
+        // The CLI numbers its own requests from 0, so a request with id 7 is not the response.
+        let request = cursor_auth_agent(r#"echo '{"jsonrpc":"2.0","id":7,"method":"cursor/task","params":{}}'; exec sleep 30"#);
+        let error = run_cursor_script("cursor-auth-id7", &request, Path::new("/dev/null")).await.unwrap_err();
+        assert_eq!(error, cursor::SIGN_IN_ERROR);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cursor_auth_deadline_exit() {
+        let _serial = concurrent_process_tests::process_test_lock().lock().await;
+        let error = run_cursor_script("cursor-auth-exit", &cursor_auth_agent("exit 0"), Path::new("/dev/null")).await.unwrap_err();
+        assert_eq!(error, cursor::SIGN_IN_ERROR);
+        assert!(!error.contains("exited"), "{error}");
+
+        // The recorded unknown-model exit: stderr names the model, then exit 1, no reply.
+        let stderr = recorded_model_stderr();
+        assert!(stderr.contains("Cannot use this model:"), "{stderr}");
+        let marker = std::env::temp_dir().join(format!("pandacode-cursor-stderr-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&marker, &stderr).unwrap();
+        let error = run_cursor_script("cursor-auth-model", &cursor_auth_agent(r#"cat "$1" >&2; exit 1"#), &marker).await.unwrap_err();
+        let _ = std::fs::remove_file(&marker);
+        assert_eq!(error, cursor::model_rejected("not-a-real-model-xyz"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cursor_auth_deadline_non_json() {
+        let _serial = concurrent_process_tests::process_test_lock().lock().await;
+        // A login URL line while armed is dropped unread, and silence after it still times out.
+        let url = cursor_auth_agent("echo 'Please visit https://example.invalid/login'; exec sleep 30");
+        let error = run_cursor_script("cursor-auth-url", &url, Path::new("/dev/null")).await.unwrap_err();
+        assert_eq!(error, cursor::SIGN_IN_ERROR);
+        assert!(!error.contains("Invalid provider JSON"), "{error}");
+
+        // The id 7 result still disarms it: the run goes on under the startup deadline.
+        let answered = cursor_auth_agent(
+            r#"echo 'Please visit https://example.invalid/login'
+echo '{"jsonrpc":"2.0","id":7,"result":{}}'
+read -r a; echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s"}}'
+read -r a; echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'"#,
+        );
+        assert_eq!(run_cursor_script("cursor-auth-url-answered", &answered, Path::new("/dev/null")).await, Ok(()));
+    }
+
+    #[cfg(unix)]
+    // The probe test holds `probe_test_guard()` (a std mutex) for the whole test on purpose.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn cursor_auth_deadline_keeps_installed() {
+        let _serial = concurrent_process_tests::process_test_lock().lock().await;
+        // The probe hook is process-wide; `probe_test_guard()` is held for the whole test on purpose.
+        let _guard = cursor::probe_test_guard();
+        let path = PathBuf::from("/opt/tool/agent");
+        cursor::set_probe_for_test(vec![path.clone()], |_| Ok(json!({"protocolVersion":1,"authMethods":[{"id":"cursor_login"}]})));
+        assert_eq!(cursor::accepted_executable().await, Some(path.clone()));
+
+        let silent = cursor_auth_agent("exec sleep 30");
+        let error = run_cursor_script("cursor-keeps-silence", &silent, Path::new("/dev/null")).await.unwrap_err();
+        assert_eq!(error, cursor::SIGN_IN_ERROR);
+        let error = run_cursor_script("cursor-keeps-exit", &cursor_auth_agent("exit 0"), Path::new("/dev/null")).await.unwrap_err();
+        assert_eq!(error, cursor::SIGN_IN_ERROR);
+
+        assert_eq!(cursor::cached_installed(), Some(path.clone()));
+        let row = discover().into_iter().find(|provider| provider.id == "cursor").unwrap();
+        assert!(row.installed);
+        assert_eq!(row.path.as_deref(), Some(path.to_string_lossy().as_ref()));
     }
 
     /// Past the old 1.5 s kill, the agent writes to both pipes (a closed one would kill it) and

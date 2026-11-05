@@ -501,7 +501,7 @@ pub async fn provider_configuration() -> Result<Configuration> {
 fn validated_executable(provider: &str, path: &str) -> Result<Option<String>> {
     if !matches!(
         provider,
-        "opencode" | "antigravity" | "glm" | "grok" | "mimo" | "pi" | "deepseek" | "commandcode" | "cline" | "kilo" | "omp" | "github-copilot" | "muse" | "devin" | "zcode" | "hermes"
+        "opencode" | "antigravity" | "glm" | "grok" | "mimo" | "pi" | "deepseek" | "commandcode" | "cline" | "kilo" | "omp" | "github-copilot" | "muse" | "devin" | "zcode" | "hermes" | "cursor"
     ) {
         return Err("This provider does not support an executable override.".into());
     }
@@ -531,6 +531,19 @@ pub(crate) fn validated_executable_path(path: &str) -> Result<Option<String>> {
     }
     Ok(Some(path.to_string_lossy().into_owned()))
 }
+/// Saves an override and drops every cache that depended on the old program. `provider_set_executable`
+/// runs exactly this, so a Cursor override discards its accepted handshake and probes again.
+fn save_and_invalidate(provider: &str, path: &str) -> Result<()> {
+    save_executable(provider, path)?;
+    crate::agent_usage::invalidate(provider);
+    crate::providers::acp_catalog::invalidate(provider);
+    crate::slash_commands::invalidate_provider(provider);
+    if provider == "cursor" {
+        crate::providers::cursor::invalidate_handshake();
+    }
+    Ok(())
+}
+
 fn save_executable(provider: &str, path: &str) -> Result<()> {
     let path = validated_executable(provider, path)?;
     let mut runtime = CONFIG
@@ -587,10 +600,7 @@ pub async fn provider_set_executable(
 ) -> Result<Configuration> {
     let changed = provider.clone();
     let result = crate::blocking(move || {
-        save_executable(&provider, &path)?;
-        crate::agent_usage::invalidate(&provider);
-        crate::providers::acp_catalog::invalidate(&provider);
-        crate::slash_commands::invalidate_provider(&provider);
+        save_and_invalidate(&provider, &path)?;
         configuration()
     })
     .await?;
@@ -1210,6 +1220,50 @@ mod tests {
         )
         .is_err());
     }
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn saving_a_cursor_override_drops_the_cached_verdict() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let _guard = crate::providers::cursor::probe_test_guard();
+        let probes = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let (seen, gate) = (probes.clone(), release.clone());
+        crate::providers::cursor::set_probe_for_test(vec![PathBuf::from("/x/agent")], move |_| {
+            // The first probe settles at once; the one the save starts is held until the
+            // assertion, so the dropped verdict cannot be replaced before it is read.
+            if seen.fetch_add(1, Ordering::SeqCst) > 0 {
+                while !gate.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+            Ok(serde_json::json!({"protocolVersion":1,"authMethods":[{"id":"cursor_login"}]}))
+        });
+        assert_eq!(crate::providers::cursor::accepted_executable().await, Some(PathBuf::from("/x/agent")));
+        assert_eq!(crate::providers::cursor::cached_installed(), Some(PathBuf::from("/x/agent")));
+        let directory = std::env::temp_dir().join(format!("pandacode-cursor-override-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        setup(&directory).unwrap();
+        let program = directory.join("agent");
+        std::fs::write(&program, b"stand-in").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        save_and_invalidate("cursor", &program.to_string_lossy()).unwrap();
+        assert_eq!(crate::providers::cursor::cached_installed(), None, "the override discarded the old handshake");
+        release.store(true, Ordering::SeqCst);
+        for _ in 0..100 {
+            if crate::providers::cursor::cached_installed().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(crate::providers::cursor::cached_installed(), Some(PathBuf::from("/x/agent")));
+        assert_eq!(probes.load(Ordering::SeqCst), 2, "and probed again");
+    }
+
     #[test]
     fn telemetry_switch_survives_reload_and_keeps_other_settings() {
         let directory =

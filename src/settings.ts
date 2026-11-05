@@ -57,7 +57,7 @@ interface SettingsOptions {
   /** Leaves Settings for the workspace. */
   close(): void;
 }
-export interface SettingsView { show(section: SettingsSection): void; dispose(): void }
+export interface SettingsView { show(section: SettingsSection): void; updateProviders(providers: Provider[]): void; dispose(): void }
 
 /** The groups in the left column, in order. Each names what it holds, not a vague umbrella. */
 export const SECTIONS: { id: SettingsSection; label: string; icon: string; description: string }[] = [
@@ -323,6 +323,7 @@ export function mountSettings(host: HTMLElement, options: SettingsOptions): Sett
   show(options.section ?? 'general', true);
   return {
     show: id => show(id, true),
+    updateProviders: all => { if (live()) updateProviders(all); },
     dispose: () => {
       if (disposed) return;
       disposed = true; readinessCleanup.forEach(cleanup => cleanup());
