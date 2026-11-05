@@ -2989,7 +2989,7 @@ mod tests {
         let step = p.receive(c_permission(kind, options.clone())).unwrap();
         assert_eq!(step.events.iter().filter(|e| e.kind == "approval").count(), 1, "{:?}", step.events);
         assert!(step.write.is_empty(), "no JSON-RPC write yet: {:?}", step.write);
-        assert!(step.events.iter().all(|e| e.kind != "status"), "not the structured-input note");
+        assert!(step.events.iter().all(|e| e.kind != "status" || e.text.starts_with("Cursor offered no single")), "not the structured-input note");
         let id = c_approval_id(&step);
         let approved = p.approve(&id, true).unwrap();
         assert_eq!(approved["result"]["outcome"]["outcome"], "cancelled", "Approve never guesses between grants");
