@@ -563,7 +563,7 @@ impl Protocol {
                     if let Some(offered) = request["params"]["options"].as_array_mut() {
                         offered.retain(|entry| entry["kind"] != allow_kind);
                     }
-                    step.events.push(self.event("status", "Cursor offered no single allow option, so Approve will grant nothing".into(), None));
+                    step.events.push(self.event("status", "Cursor offered no single allow option, so Approve will grant nothing", None));
                 }
                 let tool = &value["params"]["toolCall"];
                 let label = model_text(tool["title"].as_str(), "Allow this agent action?", 200);
