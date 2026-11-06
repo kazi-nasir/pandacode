@@ -2009,6 +2009,13 @@ impl Protocol {
         self.pending.insert(request_id, value);
         step.events.push(event);
     }
+    fn approval_capped(&mut self, value: Value, text: String, step: &mut Step) -> Result<(), String> {
+        if self.pending.len() + self.inputs.len() >= 64 {
+            return Err("Too many simultaneous approval requests".into());
+        }
+        self.approval(value, text, step);
+        Ok(())
+    }
     fn approve(&mut self, id: &str, approved: bool) -> Option<Value> {
         if self.config.provider == "muse" {
             // Muse decides only with a choice it offered; keep the prompt when none fits.

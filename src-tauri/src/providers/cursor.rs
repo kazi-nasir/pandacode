@@ -986,7 +986,7 @@ impl Protocol {
         }
         let Some(id) = id else { return };
         let stored = json!({"jsonrpc":"2.0","id":id,"method":CREATE_PLAN,"toolCallId":tool_call});
-        if let Err(error) = self.approval(stored, card.text(), step) {
+        if let Err(error) = self.approval_capped(stored, card.text(), step) {
             step.write.push(failure(&id, -32602, "Invalid params"));
             step.events.push(self.event("status", format!("{PLAN_REFUSED}{error}"), None));
         }

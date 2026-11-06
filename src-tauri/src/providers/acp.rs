@@ -624,7 +624,7 @@ impl Protocol {
                 }
                 let tool = &value["params"]["toolCall"];
                 let label = model_text(tool["title"].as_str(), "Allow this agent action?", 200);
-                self.approval(request, label, &mut step)?;
+                self.approval_capped(request, label, &mut step)?;
                 return Ok(step);
             }
         }
