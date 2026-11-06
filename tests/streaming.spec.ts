@@ -132,6 +132,7 @@ test.describe('streamed responses', () => {
     await expect(liveGroups(page).first().locator('.tool-group-summary')).toBeHidden();
     await expect.poll(openTools).toEqual([4, 5]);
     await page.keyboard.press('Meta+,');
+    await page.getByRole('tab', { name: 'General', exact: true }).click();
     await page.getByRole('checkbox', { name: 'Expand tool activity', exact: true }).check();
     await page.getByRole('button', { name: 'Back to the workspace', exact: true }).click();
     await expect(activity).toHaveAttribute('open', '');
@@ -145,6 +146,7 @@ test.describe('streamed responses', () => {
     await expect(tools.first()).toHaveAttribute('open', '');
     await expect(liveGroups(page).last()).toHaveAttribute('open', '');
     await page.keyboard.press('Meta+,');
+    await page.getByRole('tab', { name: 'General', exact: true }).click();
     await page.getByRole('checkbox', { name: 'Expand tool activity', exact: true }).uncheck();
     await page.getByRole('button', { name: 'Back to the workspace', exact: true }).click();
     await expect(activity).toHaveAttribute('open', '');
@@ -170,7 +172,7 @@ test.describe('streamed responses', () => {
     await expect(page.locator('#stream-region .activity-limit')).toBeVisible();
     await expect(live(page)).toBeVisible();
     expect(await originalResponse!.evaluate(node => node === document.querySelector('#stream-region .live-text'))).toBe(true);
-    await expect.poll(async () => (await liveSequence(page))[0]).toBe('I’m checking all project files.');
+    await expect.poll(async () => (await liveSequence(page)).at(-1)).toBe('I’m checking all project files.');
     const retainedTools = await page.locator('#stream-region .tool-activity').count();
     expect(retainedTools).toBeGreaterThan(0);
     expect(retainedTools).toBeLessThanOrEqual(30);
@@ -217,7 +219,8 @@ test.describe('streamed responses', () => {
       await expect(live(page)).toBeVisible();
       await expect(generating).toBeHidden();
       await expect(page.locator('#stream-region .turn-activity')).toHaveAttribute('open', '');
-      await expect.poll(() => liveSequence(page)).toEqual(['Inspecting the project.', '2 tools']);
+      // The latest text stays in the reply, under the steps.
+      await expect.poll(() => liveSequence(page)).toEqual(['2 tools', 'Inspecting the project.']);
 
       await push(page, id, 'Found **one** issue.');
       await expect(live(page)).toHaveText('Found one issue.');
@@ -229,7 +232,7 @@ test.describe('streamed responses', () => {
       await expect(liveGroups(page).last().locator('.tool-group-label')).toHaveText('Running 1 command…');
       await expect(liveGroups(page).last()).toHaveAttribute('open', '');
       await expect(generating).toBeHidden();
-      await expect.poll(() => liveSequence(page)).toEqual(['Inspecting the project.', '2 tools', 'Found one issue.', '1 tool']);
+      await expect.poll(() => liveSequence(page)).toEqual(['Inspecting the project.', '2 tools', '1 tool', 'Found one issue.']);
       expect(await originalResponse!.evaluate(node => node === document.querySelector('#stream-region .live-text'))).toBe(true);
 
       const firstGroup = liveGroups(page).first();
@@ -252,7 +255,7 @@ test.describe('streamed responses', () => {
       await expect(firstTool.locator('[data-tool-section="output"] pre')).toHaveText('More command output.');
       await expect(firstTool.locator('[data-tool-section="output"] pre')).toBeVisible();
       await expect(page.locator('#stream-region .tool-activity')).toHaveCount(3);
-      await expect.poll(() => liveSequence(page)).toEqual(['Inspecting the project.', '2 tools', 'Found one issue.', '1 tool']);
+      await expect.poll(() => liveSequence(page)).toEqual(['Inspecting the project.', '2 tools', '1 tool', 'Found one issue.']);
 
       await push(page, id, 'The fix is ready.');
       await expect(live(page)).toHaveText('The fix is ready.');
@@ -297,12 +300,12 @@ test.describe('streamed responses', () => {
         for (let i = 0; i < 6; i++) fixture.tool();
       }, id);
       await expect(liveGroups(page).locator('.tool-group-label')).toHaveText(['Read 5 files', 'Read 1 file']);
-      await expect.poll(() => liveSequence(page)).toEqual(['I’m checking the project files.', '5 tools', '1 tool']);
+      await expect.poll(() => liveSequence(page)).toEqual(['5 tools', '1 tool', 'I’m checking the project files.']);
 
       await push(page, id, 'The files look good. I’m checking one last detail.');
       await page.evaluate(id => (window as any).__streamFixtures[id].tool(), id);
       await expect(liveGroups(page).locator('.tool-group-label')).toHaveText(['Read 5 files', 'Read 1 file', 'Read 1 file']);
-      await expect.poll(() => liveSequence(page)).toEqual(['I’m checking the project files.', '5 tools', '1 tool', 'The files look good. I’m checking one last detail.', '1 tool']);
+      await expect.poll(() => liveSequence(page)).toEqual(['I’m checking the project files.', '5 tools', '1 tool', '1 tool', 'The files look good. I’m checking one last detail.']);
       await expect(page.locator('#stream-region .tool-activity')).toHaveCount(7);
       // In the conversation, groups the agent narrated past fold to their summary; the board keeps every group open.
       const groups = await liveGroups(page).all();
@@ -314,10 +317,9 @@ test.describe('streamed responses', () => {
       await expect(live(page)).toBeVisible();
       if (view === 'board') {
         // Narration lines up with the turn header the step rail hangs from.
-        const groupLeft = (await page.locator('#stream-region .turn-activity-summary').boundingBox())!.x;
-        for (const text of [page.locator('#stream-region [data-commentary] p').first(), live(page).locator('p').first()]) {
-          expect(Math.abs((await text.boundingBox())!.x - groupLeft)).toBeLessThanOrEqual(1);
-        }
+        // In the turn card the header row is padded, so the line to meet is its label's start, not the row's edge.
+        const groupLeft = (await page.locator('#stream-region .turn-activity-summary .turn-activity-label').boundingBox())!.x;
+        expect(Math.abs((await page.locator('#stream-region [data-commentary] p').first().boundingBox())!.x - groupLeft)).toBeLessThanOrEqual(1);
       }
       await page.screenshot({ path: `/private/tmp/pandacode-chronological-tools-${view}-${browserName}.png` });
       await finish(page, id);

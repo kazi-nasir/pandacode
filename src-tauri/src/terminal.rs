@@ -234,10 +234,12 @@ pub fn start_harness(
     )
 }
 
+pub(crate) const INSTALL_BEFORE_CONSOLE: &str = "Install this harness before opening its console.";
+
 fn harness_command(context: &HarnessContext<'_>) -> Result<CommandBuilder, String> {
     let args = harness_arguments(context)?;
     let executable = crate::providers::executable(context.provider)
-        .ok_or("Install this harness before opening its console.")?;
+        .ok_or(INSTALL_BEFORE_CONSOLE)?;
     if context.provider == "hermes" && executable.file_stem().is_some_and(|s| s == "hermes-acp") {
         return Err("Hermes ACP server does not have an interactive console. Install the `hermes` CLI for terminal chat, or continue in PandaCode.".into());
     }
@@ -297,8 +299,16 @@ fn harness_arguments(context: &HarnessContext<'_>) -> Result<Vec<String>, String
             }
         }
     }
-    if !matches!(provider, "codex" | "claude" | "kimi" | "glm" | "opencode" | "grok" | "mimo" | "pi" | "omp" | "github-copilot" | "muse" | "cline" | "devin" | "hermes") {
+    if !matches!(provider, "codex" | "claude" | "kimi" | "glm" | "opencode" | "grok" | "mimo" | "pi" | "omp" | "github-copilot" | "muse" | "cline" | "devin" | "hermes" | "cursor") {
         return Err("Choose a supported coding harness.".into());
+    }
+    if provider == "cursor" {
+        // Its ACP session id is not known to be a CLI chat id, so a task that has one never
+        // opens an unrelated chat. Accept edits and Full add nothing: no --force or --yolo.
+        if resume_id.is_some() {
+            return Err("Cursor CLI's console cannot open this task's ACP session. Continue the task in PandaCode instead.".into());
+        }
+        return Ok(if context.mode == "plan" { vec![crate::providers::cursor::PLAN_FLAG.into()] } else { Vec::new() });
     }
     if provider == "github-copilot" {
         if resume_id.is_some() {
@@ -1079,6 +1089,28 @@ mod tests {
         };
         let ask_args = harness_arguments(&ask_context).unwrap();
         assert_eq!(ask_args, ["-i", "--auto-approve", "false"]);
+    }
+
+    #[test]
+    fn cursor_console_has_plan_flag_only_and_refuses_a_resume() {
+        let context = |mode, resume_id| HarnessContext {
+            session_id: "task",
+            provider: "cursor",
+            resume_id,
+            model: Some("auto"),
+            reasoning_effort: None,
+            mode,
+        };
+        for mode in ["ask", "auto", "full"] {
+            assert_eq!(harness_arguments(&context(mode, None)).unwrap(), Vec::<String>::new());
+        }
+        assert_eq!(harness_arguments(&context("plan", None)).unwrap(), ["--mode=plan"]);
+        for mode in ["ask", "auto", "plan", "full"] {
+            assert_eq!(
+                harness_arguments(&context(mode, Some("abc"))).unwrap_err(),
+                "Cursor CLI's console cannot open this task's ACP session. Continue the task in PandaCode instead."
+            );
+        }
     }
 
     #[test]

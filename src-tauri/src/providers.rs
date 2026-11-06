@@ -36,6 +36,7 @@ mod codex_stream_tests;
 pub(crate) mod concurrent_process_tests;
 mod cline;
 mod commandcode;
+pub(crate) mod cursor;
 mod extra_models;
 mod github_copilot;
 mod devin;
@@ -64,9 +65,9 @@ mod subagents;
 mod text_stream;
 #[cfg(windows)]
 pub(crate) mod windows_job;
-pub use subagents::SubagentActivity;
+pub use subagents::{SubagentActivity, HEARTBEAT};
 
-const MAX_FRAME: usize = 4 * 1024 * 1024;
+const MAX_FRAME: usize = 64 * 1024 * 1024;
 /// Capacity the frame buffer keeps after a large message has been consumed.
 const FRAME_KEEP: usize = 64 * 1024;
 const MODEL_CATALOG_LIMIT: usize = 10_000;
@@ -92,7 +93,7 @@ const PREVIEW_TRUNCATED: &str = "\n[Preview truncated]";
 fn should_shrink(len: usize, capacity: usize) -> bool {
     capacity > 1024 * 1024 && len <= FRAME_KEEP / 2
 }
-pub(crate) const PROVIDERS: [(&str, &str); 19] = [
+pub(crate) const PROVIDERS: [(&str, &str); 20] = [
     ("claude", "Claude Code"),
     ("codex", "Codex"),
     ("kimi", "Kimi Code"),
@@ -112,6 +113,7 @@ pub(crate) const PROVIDERS: [(&str, &str); 19] = [
     ("devin", "Devin CLI"),
     ("zcode", "ZCode"),
     ("hermes", "Hermes Agent"),
+    ("cursor", "Cursor CLI"),
 ];
 
 /// Claude Code tools that only report back to a session that stays open after its turn.
@@ -541,7 +543,7 @@ pub fn validate_reasoning_effort(provider: &str, effort: Option<&str>) -> Result
     let valid = match (provider, effort) {
         (
             "claude" | "codex" | "kimi" | "glm" | "opencode" | "antigravity" | "grok" | "mimo"
-            | "pi" | "deepseek" | "commandcode" | "cline" | "kilo" | "omp" | "github-copilot" | "muse" | "devin" | "zcode" | "hermes",
+            | "pi" | "deepseek" | "commandcode" | "cline" | "kilo" | "omp" | "github-copilot" | "muse" | "devin" | "zcode" | "hermes" | "cursor",
             None,
         ) => true,
         ("claude" | "glm" | "mimo", Some(value)) => {
@@ -595,11 +597,20 @@ impl ModelInfo {
 }
 
 pub(crate) fn executable(name: &str) -> Option<PathBuf> {
+    if name == "cursor" {
+        // Only a handshake that identifies Cursor makes a program installed, and a read
+        // here never waits for it: a miss starts the background probe (see `cursor.rs`).
+        let cached = cursor::cached_installed();
+        if cached.is_none() {
+            cursor::ensure_probe();
+        }
+        return cached;
+    }
     if let Some(path) = crate::provider_settings::executable_override(name) {
         return Some(path);
     }
     launch::find(executable_name(name))
-        .or_else(|| if name == "hermes" { launch::find("hermes-acp") } else if name == "devin" { devin::bundled() } else if name == "zcode" { zcode::bundled() } else { None })
+        .or_else(|| if name == "hermes" { launch::find("hermes-acp") } else if name == "devin" { devin::bundled() } else if name == "zcode" { zcode::bundled() } else if name == "antigravity" { launch::find("agy") } else { None })
 }
 
 /// Starts a provider CLI with the provider's saved environment variables applied.
@@ -628,6 +639,10 @@ fn executable_name(name: &str) -> &str {
 /// when PandaCode was opened from Finder or the Dock with a minimal PATH.
 pub(crate) fn tool_path(name: &str) -> Option<std::path::PathBuf> {
     launch::find(name)
+}
+
+pub(crate) fn sweep_cline_mcp_settings(data: &Path) {
+    cline::sweep_mcp_settings(data);
 }
 
 pub(crate) fn opencode_configuration(mode: &str) -> String {
@@ -682,6 +697,55 @@ pub(crate) fn mimo_endpoints() -> &'static [(&'static str, &'static str, &'stati
 fn version(path: &Path) -> Option<String> {
     capture(launch::std_command(path).ok()?, &["--version"], Duration::from_secs(2))
         .map(|text| text.chars().take(150).collect())
+}
+
+/// Whether this Claude CLI takes `--include-hook-events` (absent in 2.1.0, present by 2.1.100):
+/// an unknown flag ends the CLI at launch. Answered once per binary, so an update asks again. A
+/// cloud harness's placeholder program answers no: its machine's CLI is unknown, and a
+/// longer grace covers it there.
+fn claude_lists_hook_events(command: &Command) -> bool {
+    let command = command.as_std();
+    let program = Path::new(command.get_program());
+    let key = std::fs::canonicalize(program).unwrap_or_else(|_| program.to_owned());
+    hook_events_answer(key, || {
+        let mut probe = std::process::Command::new(program);
+        probe.args(command.get_args());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            probe.creation_flags(0x08000000);
+        }
+        capture(probe, &["--help"], Duration::from_secs(2))
+    })
+}
+
+/// The answer for this binary: remembered, else `help` (None when it timed out or failed to spawn).
+fn hook_events_answer(key: PathBuf, help: impl FnOnce() -> Option<String>) -> bool {
+    static KNOWN: std::sync::LazyLock<Mutex<HashMap<PathBuf, bool>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    static PROBING: Mutex<()> = Mutex::new(());
+    let known = |key: &Path| KNOWN.lock().ok().and_then(|known| known.get(key).copied());
+    if let Some(known) = known(&key) {
+        return known;
+    }
+    // The caller is an async run start, so the wait leaves the runtime's thread free. Parallel first
+    // runs take turns and reuse the answer.
+    // ponytail: one lock for every binary; a CLI that never answers delays N parallel starts by 2 s each.
+    crate::blocking_snapshot(|| {
+        let _turn = PROBING.lock();
+        if let Some(known) = known(&key) {
+            return known;
+        }
+        // A timeout says nothing about the CLI, so only an answer is remembered. A CLI that never
+        // answers costs each run's start 2 s; one that fails to spawn fails at once.
+        let Some(help) = help() else {
+            return false;
+        };
+        let listed = help.contains("--include-hook-events");
+        if let Ok(mut known) = KNOWN.lock() {
+            known.insert(key.clone(), listed);
+        }
+        listed
+    })
 }
 
 /// Runs an installed provider's CLI and returns its stdout (up to 2 MiB); None when the
@@ -748,6 +812,9 @@ pub fn discover() -> Vec<ProviderInfo> {
             installed: path.is_some(),
             version: if id == "antigravity" {
                 "ACP".into()
+            } else if id == "cursor" {
+                // Read once per verdict; the first list has no path yet and spawns nothing.
+                path.as_deref().map(|path| cursor::version(path, version)).unwrap_or_default()
             } else {
                 path.as_deref().and_then(version).unwrap_or_default()
             },
@@ -933,7 +1000,7 @@ pub(crate) async fn list_model_catalog(provider: &str) -> Result<Vec<ModelInfo>,
     let semaphore = &model_discovery_semaphores()[index];
     let _permit = if matches!(
         provider,
-        "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "muse" | "devin" | "zcode" | "hermes"
+        "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "muse" | "devin" | "zcode" | "hermes" | "cursor"
     ) {
         // Saving models refreshes both windows. Queue their bounded metadata
         // queries so one window does not cache incomplete ID-only fallbacks.
@@ -946,6 +1013,12 @@ pub(crate) async fn list_model_catalog(provider: &str) -> Result<Vec<ModelInfo>,
             .try_acquire()
             .map_err(|_| "Model discovery is already running".to_owned())?
     };
+    if provider == "cursor" {
+        // A cold or negative cache is not "not installed": wait for the probe, then list
+        // models on the exact program it accepted (no second PATH lookup).
+        let path = cursor::accepted_executable().await.ok_or("Provider CLI is not installed or is not on PATH")?;
+        return cursor::models(&path).await;
+    }
     let path = executable(provider).ok_or("Provider CLI is not installed or is not on PATH")?;
     match provider {
         "claude" => claude_models(&path).await,
@@ -1146,6 +1219,39 @@ fn parse_claude_models(result: &Value) -> Result<Vec<ModelInfo>, String> {
     Ok(models)
 }
 
+/// Claude's initialize reply carries its commands, agents and models in one
+/// line, which can pass 256 KiB with many skills or plugins (#276).
+const CLAUDE_INIT_FRAME: usize = 4 * 1024 * 1024;
+
+async fn read_claude_models(stdout: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<Vec<ModelInfo>, String> {
+    let mut bytes = Vec::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut total = 0;
+    loop {
+        let count = stdout.read(&mut buffer).await.map_err(|e| format!("Claude model stream failed: {e}"))?;
+        if count == 0 { return Err("Claude exited before returning its model catalog; update the CLI or enter a custom model ID".into()); }
+        total += count;
+        if total > 2 * CLAUDE_INIT_FRAME { return Err("Claude model discovery exceeded its output limit".into()); }
+        // Only the new bytes can hold a newline: rescanning the held partial
+        // frame on every read would be quadratic in a multi-megabyte frame.
+        let scan = bytes.len();
+        bytes.extend_from_slice(&buffer[..count]);
+        let mut consumed = 0;
+        for end in bytes[scan..].iter().enumerate().filter_map(|(i, byte)| (*byte == b'\n').then_some(scan + i)) {
+            let line = &bytes[consumed..end]; consumed = end + 1;
+            if line.len() > CLAUDE_INIT_FRAME { return Err("Claude model catalog frame is too large".into()); }
+            if line.iter().all(u8::is_ascii_whitespace) { continue; }
+            let message: Value = serde_json::from_slice(line).map_err(|_| "Claude returned invalid model discovery JSON")?;
+            if message["type"] != "control_response" || message["response"]["request_id"] != "pandacode-models" { continue; }
+            let response = &message["response"];
+            if response["subtype"] != "success" { return Err("Claude could not load its model catalog; check the CLI or enter a custom model ID".into()); }
+            return parse_claude_models(&response["response"]);
+        }
+        bytes.drain(..consumed);
+        if bytes.len() > CLAUDE_INIT_FRAME { return Err("Claude model catalog frame is too large".into()); }
+    }
+}
+
 async fn claude_models(path: &Path) -> Result<Vec<ModelInfo>, String> {
     let mut command = provider_command("claude", path)?;
     claude_auth::configure(&mut command, "claude");
@@ -1181,29 +1287,7 @@ async fn claude_models(path: &Path) -> Result<Vec<ModelInfo>, String> {
     let mut stdout = child.stdout.take().ok_or("Claude stdout unavailable")?;
     let result = tokio::time::timeout(Duration::from_secs(15), async {
         write_json(&mut stdin, &json!({"type":"control_request","request_id":"pandacode-models","request":{"subtype":"initialize","hooks":null}})).await?;
-        let mut bytes = Vec::new();
-        let mut buffer = [0u8; 4096];
-        let mut total = 0;
-        loop {
-            let count = stdout.read(&mut buffer).await.map_err(|e| format!("Claude model stream failed: {e}"))?;
-            if count == 0 { return Err("Claude exited before returning its model catalog; update the CLI or enter a custom model ID".into()); }
-            total += count;
-            if total > 1024 * 1024 { return Err("Claude model discovery exceeded its output limit".into()); }
-            bytes.extend_from_slice(&buffer[..count]);
-            let mut consumed = 0;
-            for end in bytes.iter().enumerate().filter_map(|(i, byte)| (*byte == b'\n').then_some(i)) {
-                let line = &bytes[consumed..end]; consumed = end + 1;
-                if line.len() > 256 * 1024 { return Err("Claude model catalog frame is too large".into()); }
-                if line.iter().all(u8::is_ascii_whitespace) { continue; }
-                let message: Value = serde_json::from_slice(line).map_err(|_| "Claude returned invalid model discovery JSON")?;
-                if message["type"] != "control_response" || message["response"]["request_id"] != "pandacode-models" { continue; }
-                let response = &message["response"];
-                if response["subtype"] != "success" { return Err("Claude could not load its model catalog; check the CLI or enter a custom model ID".into()); }
-                return parse_claude_models(&response["response"]);
-            }
-            bytes.drain(..consumed);
-            if bytes.len() > 256 * 1024 { return Err("Claude model catalog frame is too large".into()); }
-        }
+        read_claude_models(&mut stdout).await
     }).await.unwrap_or_else(|_| Err("Claude model discovery timed out; check the CLI or enter a custom model ID".into()));
     drop(stdin);
     drop(group);
@@ -1308,6 +1392,8 @@ struct Protocol {
     pi: pi::State,
     muse: muse::State,
     zcode: zcode::State,
+    /// Last merged `cursor/update_todos` list for the run (each item keeps `id`, `content`, `status`).
+    cursor_todos: Value,
     // ACP may publish commands before session/new responds. Keep at most one
     // small frame until the response confirms which session owns it.
     early_kimi_commands: Option<Vec<u8>>,
@@ -1323,6 +1409,11 @@ struct Protocol {
     acp_pending_session: Option<Value>,
     grok_context_used: u64,
     grok_reasoning: bool,
+    /// A plan task whose harness advertises no plan mode: PandaCode keeps it
+    /// read-only itself (prompt prefix, permission declines).
+    plan_fallback: bool,
+    /// Which mode a fallback ran in, shown once the prompt is sent.
+    mode_note: Option<String>,
     claude_input_tokens: Option<u64>,
     claude_output_tokens: u64,
     subagents: Option<subagents::Subagents>,
@@ -1438,6 +1529,7 @@ impl Protocol {
             pi: pi::State::default(),
             muse: muse::State::default(),
             zcode: zcode::State::default(),
+            cursor_todos: json!([]),
             early_kimi_commands: None,
             tools: HashMap::new(),
             file_write_tools: HashSet::new(),
@@ -1449,6 +1541,8 @@ impl Protocol {
             acp_pending_session: None,
             grok_context_used: 0,
             grok_reasoning: false,
+            plan_fallback: false,
+            mode_note: None,
             claude_input_tokens: None,
             claude_output_tokens: 0,
             subagents: Some(subagents::Subagents::default()),
@@ -1517,7 +1611,7 @@ impl Protocol {
         // not retain a second copy for the rest of a potentially long turn.
         let mut content = std::mem::take(&mut self.image_blocks);
         let mut text = std::mem::take(&mut self.config.prompt);
-        if matches!(self.config.provider.as_str(), "grok" | "deepseek" | "muse" | "hermes") && self.config.mode == "plan" && !text.trim().is_empty() {
+        if (matches!(self.config.provider.as_str(), "grok" | "deepseek" | "muse" | "hermes") || self.plan_fallback) && self.config.mode == "plan" && !text.trim().is_empty() {
             text = format!("{}\n\n{text}", acp::READ_ONLY_PLAN_PREFIX);
         }
         if !text.trim().is_empty() {
@@ -1563,7 +1657,7 @@ impl Protocol {
         AgentEvent {
             session_id: self.config.session_id.clone(),
             kind: kind.into(),
-            text: if kind == "text" || kind == "thinking" || kind == "session" {
+            text: if matches!(kind, "text" | "thinking" | "session" | "note") {
                 text
             } else {
                 short(&text)
@@ -1633,7 +1727,9 @@ impl Protocol {
         self.tools.insert(id, tool.clone());
         // The authenticated bridge emits these calls itself. Provider tool
         // frames are retained for joining sparse results, but not shown twice.
-        if self.mcp_tool_names.contains(&tool.name) {
+        if self.mcp_tool_names.contains(&tool.name)
+            || (self.config.provider == "cline" && cline::host_tool(&tool.name).is_some_and(|name| self.mcp_tool_names.contains(name)))
+        {
             return;
         }
         let mut event = self.event("tool", format!("{} · {}", tool.name, tool.status), None);
@@ -1898,7 +1994,7 @@ impl Protocol {
                     json!({"experimentalApi":true,"requestAttestation":false});
                 request
             }
-            "kimi" | "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "devin" | "hermes" => {
+            "kimi" | "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "devin" | "hermes" | "cursor" => {
                 json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"pandacode","version":"0.1.0"}}})
             }
             _ => {
@@ -1906,15 +2002,18 @@ impl Protocol {
             }
         }
     }
-    fn approval(&mut self, value: Value, text: String, step: &mut Step) -> Result<(), String> {
-        if self.pending.len() + self.inputs.len() >= 64 {
-            return Err("Too many simultaneous approval requests".into());
-        }
+    fn approval(&mut self, value: Value, text: String, step: &mut Step) {
         let request_id = uuid::Uuid::new_v4().to_string();
         let mut event = self.event("approval", short(&text), Some(&value));
         event.request_id = Some(request_id.clone());
         self.pending.insert(request_id, value);
         step.events.push(event);
+    }
+    fn approval_capped(&mut self, value: Value, text: String, step: &mut Step) -> Result<(), String> {
+        if self.pending.len() + self.inputs.len() >= 64 {
+            return Err("Too many simultaneous approval requests".into());
+        }
+        self.approval(value, text, step);
         Ok(())
     }
     fn approve(&mut self, id: &str, approved: bool) -> Option<Value> {
@@ -1939,6 +2038,7 @@ impl Protocol {
                 json!({"id":request["id"],"result":result})
             }
             "devin" => devin::decision(&request, approved),
+            "cursor" => cursor::approve_reply(&request, approved),
             "kimi" | "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "hermes" => {
                 let options = request["params"]["options"].as_array();
                 let kinds = if approved {
@@ -1967,7 +2067,7 @@ impl Protocol {
             "codex" => {
                 json!({"id":900,"method":"turn/interrupt","params":{"threadId":self.remote_id,"turnId":self.turn_id}})
             }
-            "kimi" | "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "devin" | "hermes" => {
+            "kimi" | "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "devin" | "hermes" | "cursor" => {
                 json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":self.remote_id}})
             }
             _ => {
@@ -1991,6 +2091,18 @@ impl Protocol {
         self.subagents = Some(subagents);
         result
     }
+    /// Sends child snapshots the throttle held back; `all` also sends those not yet due.
+    fn flush_subagents(&mut self, all: bool) -> Step {
+        let mut step = Step::default();
+        if let Some(mut subagents) = self.subagents.take() {
+            step.events = subagents.flush_due(self, all);
+            self.subagents = Some(subagents);
+        }
+        step
+    }
+    fn subagent_flush_at(&self) -> Option<tokio::time::Instant> {
+        self.subagents.as_ref().and_then(subagents::Subagents::next_flush)
+    }
     fn receive_inner(&mut self, value: Value) -> Result<Step, String> {
         match self.config.provider.as_str() {
             "codex" => self.codex(value).map(|step| self.steered(step)),
@@ -1998,7 +2110,7 @@ impl Protocol {
             "pi" | "omp" => self.pi(value).map(|step| self.steered(step)),
             "zcode" => self.zcode(value).map(|step| self.steered(step)),
             "muse" => self.muse(value),
-            "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "devin" | "hermes" => self.acp(value),
+            "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" | "github-copilot" | "devin" | "hermes" | "cursor" => self.acp(value),
             _ => self.claude(value),
         }
     }
@@ -2164,7 +2276,7 @@ impl Protocol {
             },
             "item/commandExecution/requestApproval"|"item/fileChange/requestApproval"|"item/permissions/requestApproval" => {
                 let label=if params["command"].is_string() { string(params,"command") } else if params["reason"].is_string() {string(params,"reason")} else {"Allow this agent action?".into()};
-                self.approval(value,label,&mut step)?;
+                self.approval(value,label,&mut step);
             },
             "turn/completed" => {
                 self.goal_turn_completed(params, &mut step)?;
@@ -2412,7 +2524,7 @@ impl Protocol {
                     step.write.push(json!({"jsonrpc":"2.0","id":value["id"],"result":{"outcome":{"outcome":"cancelled"}}}));
                     return Ok(step);
                 }
-                let label=string(&params["toolCall"],"title");self.approval(value,if label.is_empty(){"Allow this agent action?".into()}else{label},&mut step)?;
+                let label=string(&params["toolCall"],"title");self.approval(value,if label.is_empty(){"Allow this agent action?".into()}else{label},&mut step);
             },
             _ if value.get("id").is_some() && !method.is_empty()=>step.write.push(json!({"jsonrpc":"2.0","id":value["id"],"error":{"code":-32601,"message":"Client capability not supported"}})),
             _=>{},
@@ -2457,6 +2569,7 @@ impl Protocol {
         {
             return Ok(step);
         }
+        self.claude_turn_activity(&value);
         match string(&value, "type").as_str() {
             "control_response" => {
                 let response = &value["response"];
@@ -2501,6 +2614,18 @@ impl Protocol {
             }
             "system" if value["subtype"] == "commands_changed" => {
                 self.commands_changed(&value, &mut step);
+            }
+            "system" if value["subtype"] == "background_tasks_changed" => {
+                self.claude_background_tasks(&value);
+            }
+            "system" if value["subtype"] == "task_started" => {
+                self.claude_task_started(&value);
+            }
+            "system" if matches!(field(&value, "subtype"), "hook_started" | "hook_response") => {
+                self.claude_hook(&value);
+            }
+            "system" if matches!(field(&value, "subtype"), "task_notification" | "task_updated") => {
+                self.claude_task_ended(&value);
             }
             "system" if value["subtype"] == "local_command_output" => {
                 if let Some(text) = value["content"].as_str().filter(|text| !text.is_empty()) {
@@ -2665,7 +2790,7 @@ impl Protocol {
                 }
             }
             "user" => {
-                if value["isReplay"] == true {
+                if !self.claude_notification_taken(&value) && value["isReplay"] == true {
                     self.claude_replay(&value["message"]["content"], &mut step);
                 }
                 if let Some(content) = value["message"]["content"].as_array() {
@@ -2694,7 +2819,7 @@ impl Protocol {
                     // Questions need structured answers; a boolean allow must not silently submit one.
                     if name == "AskUserQuestion" {
                         step.write.push(json!({"type":"control_response","response":{"subtype":"success","request_id":value["request_id"],"response":{"behavior":"deny","message":"Ask the user in your response; this UI supports free-text replies."}}}));
-                    } else if name.strip_prefix("mcp__pandacode_architect__").is_some_and(|tool| optional_metadata_tool(tool) || crate::bots::tools::self_scoped(tool) || crate::schedules::tools::self_scoped(tool) || crate::architect::team_tool(tool))
+                    } else if name.strip_prefix("mcp__pandacode_architect__").is_some_and(self_scoped_host_tool)
                         && self.mcp_tool_names.contains(&name)
                     {
                         // Registered metadata callbacks only stage this run's
@@ -2713,7 +2838,7 @@ impl Protocol {
                             value,
                             if command.is_empty() { name } else { command },
                             &mut step,
-                        )?;
+                        );
                     }
                 } else {
                     step.write.push(json!({"type":"control_response","response":{"subtype":"error","request_id":value["request_id"],"error":"Control request unsupported"}}));
@@ -2771,9 +2896,9 @@ impl Protocol {
                     let id = self.claude_text_id(&Value::Null);
                     self.text_snapshot(&id, None, text, &mut step);
                 }
-                // A steer Claude has not echoed yet arrived as the turn ended: Claude
-                // starts another turn for it in this process, so keep the run open.
-                step.done = !self.claude_steers_open();
+                // Claude starts another turn in this process for a steer it has not echoed
+                // and for a background agent's hand-back, so the run stays open for those.
+                step.done = self.claude_turn_ended(&value, &mut step);
             }
             _ => {}
         }
@@ -2784,7 +2909,9 @@ impl Protocol {
 async fn write_json(stdin: &mut ChildStdin, value: &Value) -> Result<(), String> {
     let mut bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // A large message over the cloud bridge drains in slow chunks; that is not a stuck harness.
+    let patience = Duration::from_secs(5 + (bytes.len() / (256 * 1024)) as u64);
+    tokio::time::timeout(patience, async {
         stdin.write_all(&bytes).await?;
         stdin.flush().await
     })
@@ -3099,6 +3226,26 @@ pub async fn run_with_tools(
     result
 }
 
+/// Codex refuses subagents past this (`AgentLimitReached`, no row, no report); a task's children have no cap of ours.
+/// The old name on purpose: 0.145+ renamed it to `max_concurrent_threads_per_session` and keep this as a serde alias,
+/// while 0.144 and older read the new name as an agent role and refuse to start.
+const CODEX_NO_THREAD_LIMIT: &str = "agents.max_threads=1024";
+
+/// Whether the user's Codex config (the home this launch uses, or the project's) sets the limit;
+/// `max_threads` is its older name. Their choice stands, and a `-c` would override it.
+fn codex_user_limits_threads(command: &Command, config: &RunConfig) -> bool {
+    let connection = crate::connections::for_task(&config.session_id, "codex");
+    let own = connection.and_then(|connection| connection.config_dir.or_else(|| connection.env.get("CODEX_HOME").cloned())).map(std::ffi::OsString::from);
+    let set = command.as_std().get_envs().find(|(name, _)| *name == "CODEX_HOME").and_then(|(_, value)| value.map(ToOwned::to_owned));
+    let home = own.or(set).or_else(|| std::env::var_os("CODEX_HOME")).map(PathBuf::from)
+        .or_else(|| crate::agent_usage_providers::home().map(|home| home.join(".codex")));
+    home.into_iter().chain([Path::new(&config.cwd).join(".codex")]).any(|dir| {
+        let Some(text) = std::fs::read_to_string(dir.join("config.toml")).ok() else { return false };
+        let Ok(toml) = text.parse::<toml::Table>() else { return false };
+        toml.get("agents").and_then(toml::Value::as_table).is_some_and(|agents| agents.contains_key("max_concurrent_threads_per_session") || agents.contains_key("max_threads"))
+    })
+}
+
 fn configure_command(command: &mut Command, config: &RunConfig) {
     claude_auth::configure(command, &config.provider);
     let use_model = !config.model.is_empty() && config.model != "default";
@@ -3106,12 +3253,20 @@ fn configure_command(command: &mut Command, config: &RunConfig) {
         "codex" => {
             // Process-local override: never alter the user's Codex config.
             command.args(["app-server", "--enable", "goals"]);
+            if !codex_user_limits_threads(command, config) {
+                command.args(["-c", CODEX_NO_THREAD_LIMIT]);
+            }
         }
         "pi" | "omp" => pi::configure(command, config),
         "zcode" => zcode::configure(command),
         "muse" => muse::configure(command, config),
         "opencode" | "antigravity" | "grok" | "deepseek" | "commandcode" | "cline" | "kilo" => acp::configure(command, config),
         "github-copilot" | "devin" | "hermes" => acp::configure(command, config),
+        "cursor" => {
+            // Cloud runs have no connection arguments; `run_inner` builds a local run itself.
+            cursor::configure(command, config);
+            command.arg("acp");
+        }
         "kimi" => {
             if use_model {
                 command.args(["--model", &config.model]);
@@ -3132,6 +3287,10 @@ fn configure_command(command: &mut Command, config: &RunConfig) {
                 // Echo consumed user messages so steering knows when a mid-turn message was taken.
                 "--replay-user-messages",
             ]);
+            // Shows a slow UserPromptSubmit hook as the owed turn starting, not a silent process.
+            if claude_lists_hook_events(command) {
+                command.arg("--include-hook-events");
+            }
             let permission_mode = match config.mode.as_str() {
                 "auto" => "acceptEdits",
                 // Claude Code's auto mode: its safety reviewer approves routine actions.
@@ -3195,6 +3354,7 @@ async fn run_inner(
         "devin",
         "zcode",
         "hermes",
+        "cursor",
     ]
     .contains(&config.provider.as_str())
     {
@@ -3213,21 +3373,61 @@ async fn run_inner(
     let mut connection = crate::connections::for_task(&config.session_id, &config.provider)
         .map(|connection| crate::connections::launch(&connection))
         .transpose()?;
-    let path = connection
-        .as_ref()
-        .and_then(|connection| connection.executable.clone())
-        .or_else(|| executable(&config.provider))
-        .ok_or_else(|| {
+    let cursor_run = config.provider == "cursor";
+    let path = if cursor_run {
+        // Only a program whose handshake identified Cursor runs; a cold or negative cache
+        // waits for a probe instead of failing as "not installed".
+        let named = connection.as_ref().and_then(|connection| connection.executable.clone());
+        let path = match named {
+            Some(named) => {
+                let env = connection.as_ref().map(|connection| connection.env.as_slice()).unwrap_or_default();
+                if let Err(error) = cursor::accept_path(&named, env).await {
+                    return Err(connection.as_ref().map_or(error.clone(), |connection| connection.redact(&error)));
+                }
+                Some(named)
+            }
+            None => match cursor::accepted_executable().await {
+                Some(path) if !path.exists() => {
+                    cursor::invalidate_handshake();
+                    cursor::accepted_executable().await
+                }
+                found => found,
+            },
+        };
+        path.ok_or_else(|| {
             reached_harness();
             format!("{} CLI is not installed or is not on PATH", config.provider)
-        })?;
+        })?
+    } else {
+        connection
+            .as_ref()
+            .and_then(|connection| connection.executable.clone())
+            .or_else(|| executable(&config.provider))
+            .ok_or_else(|| {
+                reached_harness();
+                format!("{} CLI is not installed or is not on PATH", config.provider)
+            })?
+    };
     config.cwd = external_path(&config.cwd);
     let image_blocks = attachments::load(&config.provider, &config.images).await?;
     let mut command = provider_command(&config.provider, &path)?;
-    configure_command(&mut command, &config);
-    // A named connection's arguments and environment win over the global setup.
-    if let Some(connection) = &connection {
-        connection.apply(&mut command);
+    if cursor_run {
+        // Cursor's flags, then the connection's allowed arguments once, then `acp` last;
+        // `spawn_arguments` builds that exact argv. `Launch::apply` would append the
+        // arguments after `acp`, so only the connection's environment is applied here.
+        claude_auth::configure(&mut command, &config.provider);
+        command.args(cursor::spawn_arguments(&config, connection.as_ref().map(|connection| connection.args.as_slice()).unwrap_or_default())?);
+        if let Some(connection) = &connection {
+            command.envs(connection.env.iter().map(|(key, value)| (key, value)));
+        }
+        // Last, so a connection's variables cannot drop it.
+        command.env(cursor::NO_OPEN_BROWSER, "1");
+    } else {
+        configure_command(&mut command, &config);
+        // A named connection's arguments and environment win over the global setup.
+        if let Some(connection) = &connection {
+            connection.apply(&mut command);
+        }
     }
     if config.provider == "kilo" {
         let inline = kilo::configure_environment(&mut command, &config);
@@ -3274,6 +3474,10 @@ async fn run_process(
     run_process_with_tools(config, sink, input, command, image_blocks, None).await
 }
 
+/// Host tools that need no permission prompt once registered for the run.
+fn self_scoped_host_tool(name: &str) -> bool {
+    optional_metadata_tool(name) || crate::bots::tools::self_scoped(name) || crate::schedules::tools::self_scoped(name) || crate::architect::team_tool(name)
+}
 fn optional_metadata_tool(name: &str) -> bool {
     name == crate::session_titles::TOOL || name == crate::turn_changes::TRACK_TOOL
 }
@@ -3380,7 +3584,7 @@ async fn run_process_with_tools(
         }
         (
             "claude" | "glm" | "mimo" | "kimi" | "opencode" | "antigravity" | "grok" | "pi"
-            | "deepseek" | "commandcode" | "cline" | "kilo" | "omp" | "github-copilot" | "muse" | "devin" | "hermes",
+            | "deepseek" | "commandcode" | "cline" | "kilo" | "omp" | "github-copilot" | "muse" | "devin" | "hermes" | "cursor",
             Some(host),
         ) => (
             None,
@@ -3401,6 +3605,16 @@ async fn run_process_with_tools(
     let _pi_bridge = if matches!(config.provider.as_str(), "pi" | "omp") {
         Some(pi::Bridge::configure(&mut command, &config.mode, mcp.as_ref())?)
     } else { None };
+    let cline_settings = match &mcp {
+        Some(server) if config.provider == "cline" && !crate::cloud_agents::transport::is_cloud(&config.session_id) => {
+            match cline::mcp_settings(&mut command, &server.kimi_config()) {
+                Ok(folder) => Some(folder),
+                Err(error) if server.required() => return Err(error),
+                Err(_) => None,
+            }
+        }
+        _ => None,
+    };
     reached_harness();
     let lingers = config.provider == "antigravity" && !crate::cloud_agents::transport::is_cloud(&config.session_id);
     let mut agent_temp = None;
@@ -3435,9 +3649,13 @@ async fn run_process_with_tools(
     let stderr = child.stderr.take().ok_or("Provider stderr unavailable")?;
     let mut stderr_task = StderrReader(tokio::spawn(read_stderr(stderr)));
     let mut protocol = Protocol::new(config);
+    if crate::cloud_agents::transport::is_cloud(&protocol.config.session_id) {
+        protocol.claude_over_cloud();
+    }
     protocol.image_blocks = image_blocks;
     protocol.host = host;
-    protocol.mcp_server = mcp.as_ref().map(mcp_host::Server::kimi_config);
+    // Cline already has the server from its settings file, not from `session/new`.
+    protocol.mcp_server = mcp.as_ref().filter(|_| cline_settings.is_none()).map(mcp_host::Server::kimi_config);
     protocol.mcp_required = mcp.as_ref().is_some_and(mcp_host::Server::required);
     protocol.codex_mcp_servers = mcp
         .as_ref()
@@ -3456,6 +3674,9 @@ async fn run_process_with_tools(
     let step_limit = startup_step();
     let mut deadline = startup_deadline(started, started, step_limit);
     let mut answered = false;
+    // Cursor only: armed once `authenticate` is written, disarmed by its response.
+    let mut auth = cursor::AuthWatch::for_provider(&protocol.config.provider);
+    let mut auth_exited = false;
     let result=async {
         write_json(&mut stdin,&protocol.initial()).await?;
         if protocol.config.provider == "antigravity" {
@@ -3470,7 +3691,7 @@ async fn run_process_with_tools(
                         Some(RunInput::Steer{id,text,reply})=>{let step=protocol.steer(id,text,reply);apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await?;},
                         Some(RunInput::Approval{request_id,approved})=>{if !mcp.as_ref().is_some_and(|server|server.approve(&request_id,approved)) {let step=protocol.approval_step(&request_id,approved); apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await?;}},
                         Some(RunInput::UserInput{request_id,response,reply})=>{
-                            match if protocol.config.provider=="muse" {protocol.muse_user_input(&request_id,response)} else {protocol.user_input(&request_id,response)} {
+                            match match protocol.config.provider.as_str() {"muse"=>protocol.muse_user_input(&request_id,response),"cursor"=>protocol.cursor_user_input(&request_id,response),_=>protocol.user_input(&request_id,response)} {
                                 Ok(step)=>{let result=apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await.map(|_|());if let Some(reply)=reply {let _=reply.send(result.clone());}result?;},
                                 Err(error)=>{if let Some(reply)=reply {let _=reply.send(Err(error));}},
                             }
@@ -3504,8 +3725,19 @@ async fn run_process_with_tools(
                 _=tokio::time::sleep_until(deadline),if stopped || protocol.phase==0=>{
                     if stopped{break Ok(());}break Err(startup_timeout_error(started.elapsed(),answered));
                 },
+                _=tokio::time::sleep_until(auth.deadline().unwrap_or_else(||tokio::time::Instant::now()+Duration::from_secs(86400))),if !stopped && auth.armed()=>{
+                    break Err(cursor::SIGN_IN_ERROR.into());
+                },
                 _=tokio::time::sleep_until(protocol.approval_deadline().unwrap_or_else(||tokio::time::Instant::now()+Duration::from_secs(86400))),if !stopped && protocol.approval_deadline().is_some()=>{
                     let step=protocol.expire_approvals(tokio::time::Instant::now());
+                    apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await?;
+                },
+                _=tokio::time::sleep_until(protocol.claude_grace().unwrap_or_else(||tokio::time::Instant::now()+Duration::from_secs(86400))),if !stopped && protocol.claude_grace().is_some()=>{
+                    let step=protocol.claude_wait_over();
+                    if apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await? {return Ok(());}
+                },
+                _=tokio::time::sleep_until(protocol.subagent_flush_at().unwrap_or_else(||tokio::time::Instant::now()+Duration::from_secs(86400))),if !stopped && protocol.subagent_flush_at().is_some()=>{
+                    let step=protocol.flush_subagents(false);
                     apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await?;
                 },
                 _=tokio::time::sleep_until(protocol.goals.deadline().unwrap_or_else(||tokio::time::Instant::now()+Duration::from_secs(86400))),if protocol.goals.deadline().is_some()=>{
@@ -3514,7 +3746,17 @@ async fn run_process_with_tools(
                 },
                 read=stdout.read(&mut buf)=>{
                     let count=read.map_err(|e|format!("Provider stream failed: {e}"))?;
-                    if count==0 {if stopped{break Ok(());}break Err("Agent exited before completing its response".into());}
+                    if count==0 {
+                        if stopped{break Ok(());}
+                        if auth.armed() {auth_exited=true;break Err(cursor::SIGN_IN_ERROR.into());}
+                        // Exited after a finished turn, while the run was only waiting for another.
+                        if protocol.claude_idle() {
+                            let step=protocol.claude_end_idle();
+                            apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await?;
+                            break Ok(());
+                        }
+                        break Err("Agent exited before completing its response".into());
+                    }
                     // Retained bytes contain no newline: only scan this read.
                     // Rescanning the entire partial frame makes large tool
                     // results quadratic and can starve other concurrent runs.
@@ -3527,14 +3769,21 @@ async fn run_process_with_tools(
                         let line=&bytes[consumed..end];consumed=end+1;
                         if line.len()>MAX_FRAME{return Err("Provider sent an oversized JSON message".into());}
                         if line.iter().all(u8::is_ascii_whitespace){continue;}
-                        let value:Value=serde_json::from_slice(line).map_err(|e|format!("Invalid provider JSON: {e}"))?;
+                        let value:Value=match serde_json::from_slice(line) {
+                            Ok(value)=>value,
+                            // Before `authenticate` is answered a line may be a login URL; drop it unread.
+                            Err(_) if auth.armed()=>continue,
+                            Err(e)=>return Err(format!("Invalid provider JSON: {e}")),
+                        };
                         if stopped {
                             if pi::stop_settled(&protocol.config.provider, &value) {return Ok(());}
                             continue;
                         }
                         answered=true;
                         if protocol.phase==0 {deadline=startup_deadline(started,tokio::time::Instant::now(),step_limit);}
+                        auth.received(&value);
                         let step=protocol.receive(value)?;
+                        auth.written(&step.write,tokio::time::Instant::now());
                         if apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await? {return Ok(());}
                     }
                     bytes.drain(..consumed);
@@ -3550,6 +3799,15 @@ async fn run_process_with_tools(
     jobs.abort_all();
     queued.clear();
     protocol.goals.cancel_pending();
+    // Before the run settles its children, so the last text a throttle held back is the one saved.
+    for event in protocol.flush_subagents(true).events {
+        sink(event);
+    }
+    if result.is_ok() && !stopped {
+        for event in protocol.lost_reports_note() {
+            sink(event);
+        }
+    }
     for event in protocol.steers_ended(result.is_ok() && !stopped) {
         sink(event);
     }
@@ -3571,6 +3829,13 @@ async fn run_process_with_tools(
         .map(|server| server.redact(&diagnostic))
         .unwrap_or(diagnostic);
     result.map_err(|error: String| {
+        // Cursor's own sentences stand alone: stderr may hold a login URL or the account's models.
+        if auth_exited {
+            return cursor::auth_exit(&diagnostic);
+        }
+        if cursor::is_own_error(&error) {
+            return error;
+        }
         let error = mcp
             .as_ref()
             .map(|server| server.redact(&error))
@@ -4256,6 +4521,32 @@ mod tests {
     }
 
     #[test]
+    fn codex_launches_without_its_thread_limit_unless_the_user_set_one() {
+        let dir = std::env::temp_dir().join(format!("pandacode-codex-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("home")).unwrap();
+        std::fs::create_dir_all(dir.join("project/.codex")).unwrap();
+        let args = |toml: &str, project: &str| {
+            std::fs::write(dir.join("home/config.toml"), toml).unwrap();
+            std::fs::write(dir.join("project/.codex/config.toml"), project).unwrap();
+            let mut cfg = config("codex");
+            cfg.cwd = dir.join("project");
+            let mut command = Command::new("codex");
+            command.env("CODEX_HOME", dir.join("home"));
+            configure_command(&mut command, &cfg);
+            command.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>()
+        };
+        let plain = ["app-server", "--enable", "goals"];
+        // Checked by starting `codex app-server` with it on 0.141.0 to 0.162.1: the newer name stops 0.144.1 and older.
+        let lifted = [&plain[..], &["-c", "agents.max_threads=1024"]].concat();
+        assert_eq!(args("model = \"x\"\n[agents]\nmax_depth = 2\n", ""), lifted);
+        assert_eq!(args("not toml [", ""), lifted, "Codex reports a broken config itself");
+        assert_eq!(args("[agents]\nmax_concurrent_threads_per_session = 3\n", ""), plain);
+        assert_eq!(args("[agents]\nmax_threads = 3\n", ""), plain, "its older name");
+        assert_eq!(args("", "[agents]\nmax_threads = 3\n"), plain, "a project's config");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn claude_effort_is_passed_to_cli_and_unsupported_model_rejected_before_prompt() {
         for resume in [false, true] {
             let mut cfg = config("claude");
@@ -4910,6 +5201,21 @@ mod tests {
         assert!(parse_claude_models(&json!({"models":vec![json!({});101]})).is_err());
     }
 
+    #[tokio::test]
+    async fn claude_catalog_reads_an_initialize_frame_over_256_kib() {
+        // #276: many skills and plugins push Claude's one-line initialize reply
+        // past the old 256 KiB frame limit.
+        let commands: Vec<Value> = (0..3000).map(|i| json!({"name":format!("skill-{i}"),"description":"d".repeat(100)})).collect();
+        let init = json!({"type":"control_response","response":{"request_id":"pandacode-models","subtype":"success","response":{"commands":commands,"models":[{"value":"sonnet","resolvedModel":"claude-sonnet-5","displayName":"Sonnet"}]}}});
+        let output = format!("{{\"type\":\"system\"}}\n{init}\n");
+        assert!(output.len() > 256 * 1024);
+        let models = read_claude_models(&mut output.as_bytes()).await.unwrap();
+        assert_eq!(models[1].id, "sonnet");
+        // Memory stays bounded: an endless frame is refused at the limit.
+        let endless = vec![b'x'; CLAUDE_INIT_FRAME + 1];
+        assert!(read_claude_models(&mut endless.as_slice()).await.unwrap_err().contains("too large"));
+    }
+
     #[test]
     fn model_catalog_bounds_display_metadata_and_serializes_only_picker_fields() {
         let models = parse_codex_models(&json!({"data":[{"model":"actual","displayName":"a".repeat(500),"description":"b".repeat(2000),"account":"private"}]})).unwrap();
@@ -5133,6 +5439,116 @@ read -r a; echo '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}
         let run = run_script("opencode", "startup-stalled", stalls, Path::new("/dev/null"));
         let error = TEST_STARTUP_STEP.scope(Duration::from_millis(300), run).await.unwrap_err();
         assert!(error.contains("stopped answering"), "{error}");
+    }
+
+    /// A Cursor stand-in: answers `initialize`, reads the `authenticate` request, then runs `$after`.
+    #[cfg(unix)]
+    fn cursor_auth_agent(after: &str) -> String {
+        format!(
+            r#"read -r a; echo '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}'
+read -r a
+{after}"#
+        )
+    }
+
+    /// Runs `script` as the `cursor` provider with the `authenticate` wait cut to 300 ms.
+    #[cfg(unix)]
+    async fn run_cursor_script(id: &str, script: &str, marker: &Path) -> Result<(), String> {
+        let run = run_script("cursor", id, script, marker);
+        cursor::TEST_AUTH_DEADLINE.scope(Duration::from_millis(300), run).await
+    }
+
+    /// The stderr text of the recorded unknown `--model` exit (`model-unknown-load.jsonl`).
+    #[cfg(unix)]
+    fn recorded_model_stderr() -> String {
+        include_str!("providers/cursor_frames/model-unknown-load.jsonl")
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|frame| frame["dir"] == "stderr")
+            .filter_map(|frame| frame["text"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cursor_auth_deadline_silence() {
+        let _serial = concurrent_process_tests::process_test_lock().lock().await;
+        let silent = cursor_auth_agent("exec sleep 30");
+        let error = run_cursor_script("cursor-auth-silence", &silent, Path::new("/dev/null")).await.unwrap_err();
+        assert_eq!(error, cursor::SIGN_IN_ERROR);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cursor_auth_deadline_id7_request() {
+        let _serial = concurrent_process_tests::process_test_lock().lock().await;
+        // The CLI numbers its own requests from 0, so a request with id 7 is not the response.
+        let request = cursor_auth_agent(r#"echo '{"jsonrpc":"2.0","id":7,"method":"cursor/task","params":{}}'; exec sleep 30"#);
+        let error = run_cursor_script("cursor-auth-id7", &request, Path::new("/dev/null")).await.unwrap_err();
+        assert_eq!(error, cursor::SIGN_IN_ERROR);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cursor_auth_deadline_exit() {
+        let _serial = concurrent_process_tests::process_test_lock().lock().await;
+        let error = run_cursor_script("cursor-auth-exit", &cursor_auth_agent("exit 0"), Path::new("/dev/null")).await.unwrap_err();
+        assert_eq!(error, cursor::SIGN_IN_ERROR);
+        assert!(!error.contains("exited"), "{error}");
+
+        // The recorded unknown-model exit: stderr names the model, then exit 1, no reply.
+        let stderr = recorded_model_stderr();
+        assert!(stderr.contains("Cannot use this model:"), "{stderr}");
+        let marker = std::env::temp_dir().join(format!("pandacode-cursor-stderr-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&marker, &stderr).unwrap();
+        let error = run_cursor_script("cursor-auth-model", &cursor_auth_agent(r#"cat "$1" >&2; exit 1"#), &marker).await.unwrap_err();
+        let _ = std::fs::remove_file(&marker);
+        assert_eq!(error, cursor::model_rejected("not-a-real-model-xyz"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cursor_auth_deadline_non_json() {
+        let _serial = concurrent_process_tests::process_test_lock().lock().await;
+        // A login URL line while armed is dropped unread, and silence after it still times out.
+        let url = cursor_auth_agent("echo 'Please visit https://example.invalid/login'; exec sleep 30");
+        let error = run_cursor_script("cursor-auth-url", &url, Path::new("/dev/null")).await.unwrap_err();
+        assert_eq!(error, cursor::SIGN_IN_ERROR);
+        assert!(!error.contains("Invalid provider JSON"), "{error}");
+
+        // The id 7 result still disarms it: the run goes on under the startup deadline.
+        let answered = cursor_auth_agent(
+            r#"echo 'Please visit https://example.invalid/login'
+echo '{"jsonrpc":"2.0","id":7,"result":{}}'
+read -r a; echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s"}}'
+read -r a; echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'"#,
+        );
+        assert_eq!(run_cursor_script("cursor-auth-url-answered", &answered, Path::new("/dev/null")).await, Ok(()));
+    }
+
+    #[cfg(unix)]
+    // The probe test holds `probe_test_guard()` (a std mutex) for the whole test on purpose.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn cursor_auth_deadline_keeps_installed() {
+        let _serial = concurrent_process_tests::process_test_lock().lock().await;
+        // The probe hook is process-wide; `probe_test_guard()` is held for the whole test on purpose.
+        let _guard = cursor::probe_test_guard();
+        let path = PathBuf::from("/opt/tool/agent");
+        cursor::set_probe_for_test(vec![path.clone()], |_| Ok(json!({"protocolVersion":1,"authMethods":[{"id":"cursor_login"}]})));
+        assert_eq!(cursor::accepted_executable().await, Some(path.clone()));
+
+        let silent = cursor_auth_agent("exec sleep 30");
+        let error = run_cursor_script("cursor-keeps-silence", &silent, Path::new("/dev/null")).await.unwrap_err();
+        assert_eq!(error, cursor::SIGN_IN_ERROR);
+        let error = run_cursor_script("cursor-keeps-exit", &cursor_auth_agent("exit 0"), Path::new("/dev/null")).await.unwrap_err();
+        assert_eq!(error, cursor::SIGN_IN_ERROR);
+
+        assert_eq!(cursor::cached_installed(), Some(path.clone()));
+        let row = discover().into_iter().find(|provider| provider.id == "cursor").unwrap();
+        assert!(row.installed);
+        assert_eq!(row.path.as_deref(), Some(path.to_string_lossy().as_ref()));
     }
 
     /// Past the old 1.5 s kill, the agent writes to both pipes (a closed one would kill it) and

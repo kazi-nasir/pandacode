@@ -1,0 +1,4 @@
+{"args":["--mode=bogus","acp"]}
+{"t":0,"dir":"out","frame":{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"pandacode","version":"0.1.0"}}}}
+{"t":728,"dir":"stderr","text":"error: option '--mode <mode>' argument 'bogus' is invalid. Allowed choices are plan, ask.\n"}
+{"t":745,"dir":"exit","code":1,"signal":null}

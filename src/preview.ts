@@ -37,6 +37,12 @@ if (typeof location !== 'undefined' && new URLSearchParams(location.search).has(
 if (typeof location !== 'undefined' && new URLSearchParams(location.search).has('trace')) sessions = [...sessions,
   { id: BRIEF_ID, projectId: 'project-1', title: 'Morning brief', provider: 'claude', model: 'sonnet', mode: 'ask', status: 'idle', createdAt: now - 50000, updatedAt: now + 2000, archived: false, worktreePath: null, resumeId: null, lastResponseAt: null },
   { id: GALLERY_ID, projectId: 'project-1', title: 'Tool gallery', provider: 'claude', model: 'sonnet', mode: 'ask', status: 'idle', createdAt: now - 40000, updatedAt: now + 3000, archived: false, worktreePath: null, resumeId: null, lastResponseAt: now - 100000 }];
+// Turn cards (src/turn-card.ts): opt in with ?cards for a thread with a short reply and a long one with changes.
+const slowTurn = typeof location !== 'undefined' && new URLSearchParams(location.search).has('slowturn');
+/** ?shortreply: the command finishes, then a one-line reply too short to fill the space its folded trace gave up. */
+const shortReply = typeof location !== 'undefined' && new URLSearchParams(location.search).has('shortreply');
+const showCards = typeof location !== 'undefined' && new URLSearchParams(location.search).has('cards');
+if (showCards) sessions = [{ id: 'session-cards', projectId: 'project-1', title: 'Turn cards', provider: 'claude', model: 'sonnet', mode: 'ask', status: 'idle', createdAt: now - 30000, updatedAt: now + 4000, archived: false, worktreePath: null, resumeId: null, lastResponseAt: now - 1000 }, ...sessions];
 // The preview persists sidebar preferences only, never sample conversation data.
 const THREAD_ORDER_KEY = 'pandacode.preview.threadOrder';
 type ThreadOrder = { id: string; pinned: boolean; sidebarOrder: number | null };
@@ -155,6 +161,7 @@ function previewProviderConfiguration(): Record<string, unknown> {
     globalEnvironment: previewEnvNames(previewEnvState.global),
     environment: Object.fromEntries(Object.entries(previewEnvState.providers).map(([provider, vars]) => [provider, previewEnvNames(vars)])),
     useGlobalEnvironment: previewEnvState.useGlobal,
+    providers: providers.map(provider => [provider.id, provider.name]),
     glmKeySaved: false, glmKeyFromEnvironment: false, deepseekKeySaved: false, deepseekKeyFromEnvironment: false, commandcodeKeySaved: false, commandcodeKeyFromEnvironment: false, mimoKeySaved: false, mimoKeyFromEnvironment: false, mimoEndpoint: previewMimoEndpoint, mimoEndpoints: previewMimoEndpoints, secureStorageAvailable: false,
   };
 }
@@ -182,8 +189,18 @@ const traceMessages: Message[] = [
   { id: 130, sessionId: 'session-5', role: 'assistant', content: 'Search now compares a normalized form of the query and each title, so case and accents no longer matter.\n\n- Added `normalize()` in `src/lib/normalize.ts`.\n- The tests pass; lint flags the new regex and needs the `u` flag follow-up.', createdAt: now - 604000000 },
 ];
 // Trace showcase thread: opt in with ?trace so default session counts stay unchanged.
+const cardTool = (id: string, name: string, input: string, output: string) => encodeTool({ id, name, status: 'completed', input, output });
+const cardMessages: Message[] = [
+  { id: 9001, sessionId: 'session-cards', role: 'user', content: 'Which file owns the search index?', createdAt: now - 30000, turnDurationMs: 4000 },
+  { id: 9002, sessionId: 'session-cards', role: 'assistant', content: 'The index lives in `src/search-index.ts`; `createSearchIndex()` builds it once per data set.', createdAt: now - 26000 },
+  { id: 9003, sessionId: 'session-cards', role: 'user', content: 'Make the results update instantly and keep keyboard navigation working.', createdAt: now - 20000, turnDurationMs: 5_410_000 },
+  { id: 9004, sessionId: 'session-cards', role: 'tool', content: cardTool('card-read', 'Read', 'src/components/search.ts', sampleSource), createdAt: now - 19000 },
+  { id: 9005, sessionId: 'session-cards', role: 'tool', content: cardTool('card-shot', 'Read', 'design/search-results.png', 'Image read'), createdAt: now - 18000 },
+  { id: 9006, sessionId: 'session-cards', role: 'tool', content: cardTool('card-test', 'Bash', 'npm test -- search', sampleTestOutput), createdAt: now - 15000 },
+  { id: 9007, sessionId: 'session-cards', role: 'assistant', content: 'Search now responds as you type.\n\n- **The index is built once.** `createSearchIndex()` moved out of the input handler, so a keystroke only queries it.\n- **Rendering is limited to the visible rows.** `renderResults()` draws the first 50 matches and the list virtualizes the rest.\n- **Keyboard navigation is unchanged.** ↑/↓ still move the selection and Enter opens the result; the existing tests cover both.\n\nI also added a test that types ten characters in a row and checks the index is built only once. Every search test passes.\n\nOne follow-up worth considering: the index is rebuilt when the data set changes, which happens on every sync. If syncs get frequent, an incremental update would avoid the rebuild entirely.', createdAt: now - 1000 },
+];
 const showTrace = typeof location !== 'undefined' && new URLSearchParams(location.search).has('trace');
-const messages: Record<string, Message[]> = { ...(showTrace ? { 'session-5': traceMessages, [BRIEF_ID]: briefMessages, [GALLERY_ID]: galleryMessages } : {}), 'session-1': [
+const messages: Record<string, Message[]> = { ...(showCards ? { 'session-cards': cardMessages } : {}), ...(showTrace ? { 'session-5': traceMessages, [BRIEF_ID]: briefMessages, [GALLERY_ID]: galleryMessages } : {}), 'session-1': [
   { id: 1, sessionId: 'session-1', role: 'user', content: 'Search feels a little slow. Can you make it respond instantly as I type, and keep the keyboard navigation working?', createdAt: now - 420000 },
   { id: 2, sessionId: 'session-1', role: 'assistant', content: 'I’ll trace how the search input updates the results, then check the keyboard interactions.', createdAt: now - 410000 },
   { id: 3, sessionId: 'session-1', role: 'tool', content: encodeTool({ id: 'sample-read', name: 'Read', status: 'completed', input: 'src/components/search.ts', output: sampleSource }), createdAt: now - 400000 },
@@ -212,6 +229,7 @@ const providers: Provider[] = [
   { id: 'devin', name: 'Devin CLI', installed: true, path: '/sample/bin/devin', version: 'devin 3000.11.216 (sample)', models: [] },
   { id: 'zcode', name: 'ZCode', installed: true, path: '/sample/bin/zcode', version: '3.16.3', models: [] },
   { id: 'hermes', name: 'Hermes Agent', installed: true, path: '/sample/bin/hermes', version: 'hermes 0.5.0 (sample)', models: [] },
+  { id: 'cursor', name: 'Cursor CLI', installed: true, path: '/sample/bin/agent', version: '2026.09.15-d2fe57e (sample)', models: [] },
 ];
 // Mirrors providers::mimo::ENDPOINTS; the native side is the authority.
 const previewMimoEndpoints = [
@@ -221,7 +239,9 @@ const previewMimoEndpoints = [
   { id: 'api', url: 'https://api.xiaomimimo.com/anthropic', label: 'Pay-as-you-go API' },
 ];
 let previewMimoEndpoint: string | null = null;
-let previewAgentsDockPreferences = { enabled: true, keepOnScreen: true, pinned: false };
+const AGENTS_DOCK_KEY = 'pandacode.preview.agents-dock';
+let previewAgentsDockPreferences = { enabled: false, keepOnScreen: true, pinned: false };
+try { previewAgentsDockPreferences = { ...previewAgentsDockPreferences, ...JSON.parse(localStorage.getItem(AGENTS_DOCK_KEY) ?? '{}') }; } catch { /* Defaults. */ }
 const previewAgentsDockSnapshot = {
   agents: [
     { id: 'preview-active', title: 'Polish the new onboarding', projectName: 'PandaCode', provider: 'codex', model: 'gpt-5.6-sol', status: 'running', elapsedSeconds: 94 },
@@ -287,6 +307,10 @@ const catalogs: Record<ProviderId, ProviderModel[]> = {
     { id: 'anthropic/claude-sonnet-4', name: 'Claude Sonnet 4', description: 'Sample Hermes provider model.' },
     // A long catalog (over the team limit of 10) for Settings → Model routing.
     ...Array.from({ length: 12 }, (_, i) => ({ id: `nous/sample-${i + 1}`, name: `Nous Sample ${i + 1}`, description: 'Sample Hermes provider model.' })),
+  ],
+  cursor: [
+    { id: 'composer-2.5', name: 'Composer 2.5', description: 'Sample Cursor CLI model.' },
+    { id: 'gpt-5.3-codex-high', name: 'GPT-5.3 Codex High', description: 'Sample Cursor CLI model.' },
   ],
   muse: ['muse-wonder-1.0', 'muse-spark-1.3'].map(id => ({ id, name: id, description: '', reasoningEfforts: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'].map(effort => ({ id: effort, name: effort === 'xhigh' ? 'Extra high' : effort[0].toUpperCase() + effort.slice(1), description: '' })), defaultReasoningEffort: 'high', contextWindow: 1007997 })),
   opencode: openCodePreviewModels,
@@ -581,6 +605,8 @@ export function samplePick(kind: 'files' | 'folder'): string[] {
   return kind === 'folder' ? ['/Users/you/Projects/orbit-design'] : ['/Users/you/Pictures/dashboard-mockup.png', '/Users/you/Documents/Product brief.pdf'];
 }
 function agent(event: AgentEvent) { emit('agent-event', event); }
+/** `MESSAGE_LIMIT` in lib.rs. */
+const MESSAGE_LIMIT = 16 * 1024 * 1024;
 /** tests: a live `subagent` event for any task (`__previewSubagent('session-1', { id, name, status, … })`). */
 (window as any).__previewSubagent = (sessionId: string, data: Record<string, unknown>) => agent({ sessionId, kind: 'subagent', text: '', data: { parentId: null, prompt: '', response: '', tools: [], startedAt: now, updatedAt: Date.now(), ...data } } as unknown as AgentEvent);
 function session(value: unknown): Session { const result = sessions.find(s => s.id === value); if (!result) throw new Error('Task not found'); return result; }
@@ -589,7 +615,7 @@ function assertIdle(s: Session): void {
 }
 function taskDetails(title: unknown, description: unknown): { title: string; taskDescription: string } {
   if (typeof title !== 'string' || !title.trim() || title.length > 200) throw new Error('Title must be 1–200 characters.');
-  if (typeof description !== 'string' || new TextEncoder().encode(description).length > 128 * 1024) throw new Error('Task description must be under 128 KiB.');
+  if (typeof description !== 'string' || new TextEncoder().encode(description).length > MESSAGE_LIMIT) throw new Error('Task details must be under 16 MiB.');
   return { title: title.trim(), taskDescription: description.trim() };
 }
 function taskSummary(s: Session): Session {
@@ -882,7 +908,7 @@ const architect = createPreviewArchitect({
 
 /* Threads an agent launched on other machines (docs/machine-orchestration.md): ordinary mirror
  * sessions here, each recorded with its parent. Tests add them with `__machineChild`. */
-const machineParents = new Map<string, string>(), machineStopped = new Set<string>();
+const machineParents = new Map<string, string>(), machineStopped = new Set<string>(), machineOffline = new Set<string>();
 /** Like the native command: every live thread (running/waiting) plus the 24 newest settled ones, oldest first. */
 const SETTLED_SHOWN = 24;
 function machineRows(parentId: string) {
@@ -890,6 +916,7 @@ function machineRows(parentId: string) {
     sessionId: child.id, title: child.title, provider: child.provider, model: child.model,
     status: machineStopped.has(child.id) && child.status === 'idle' ? 'interrupted' : child.status,
     machine: child.remoteDevice ?? { id: 'dev-studio', name: 'Studio iMac' }, createdAt: child.createdAt,
+    ...(machineOffline.has(child.id) ? { hostOffline: true } : {}),
   }));
 }
 function machineChildren(parentId: string) {
@@ -915,6 +942,8 @@ function installMachineChildren(): void {
     const at = Date.now();
     (messages[sessionId] ??= []).push({ id: ++id, sessionId, role: 'coordination', coordinationKind: 'machine_threads', content: 'Machine threads finished', createdAt: at }, { id: ++id, sessionId, role: 'assistant', content: 'Both threads finished; here is the combined report.', createdAt: at + 1 });
   };
+  // The computer running a thread dropping off or coming back.
+  w.__machineChildOffline ??= (id: string, offline: boolean) => { if (offline) machineOffline.add(id); else machineOffline.delete(id); emit('sessions-changed', {}); };
   w.__machineChildStatus ??= (id: string, status: string) => { session(id).status = status; agent({ sessionId: id, kind: 'status', text: status }); emit('sessions-changed', {}); };
 }
 /** Menu bar popover data; `window.__trayCalls` records what it asked for. */
@@ -953,6 +982,7 @@ function previewAgentsDock<T>(command: string, args: Record<string, any>): T {
       keepOnScreen: Boolean(args.keepOnScreen),
       pinned: args.enabled ? previewAgentsDockPreferences.pinned : false,
     };
+    localStorage.setItem(AGENTS_DOCK_KEY, JSON.stringify(previewAgentsDockPreferences));
     emit('agents-dock-preferences-changed', structuredClone(previewAgentsDockPreferences));
     return structuredClone(previewAgentsDockPreferences) as T;
   }
@@ -994,6 +1024,10 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
   });
   if (command === 'remote_device_grants' || command === 'remote_set_device_grant' || command.startsWith('remote_pair_')) return (await import('./preview-grants')).previewGrants(command, args) as T;
   if (command === 'remote_diagnostics' || command === 'remote_diagnostics_export') return (await import('./preview-diagnostics')).previewDiagnostics(command, args) as T;
+  if (command === 'list_files' && (window as any).__filesFail) {
+    // Test seam: `__filesFail` fails folder reads like a moved project folder; relink_project clears it.
+    throw new Error('Project folder is unavailable: No such file or directory (os error 2)');
+  }
   if (command === 'remote_reconnect') {
     // Tests steer it: `__remoteReconnectHold` waits for `__remoteReconnectRelease()`, `__remoteReconnectFail` is an error text.
     const w = window as any; w.__remoteReconnects = (w.__remoteReconnects ?? 0) + 1;
@@ -1066,7 +1100,7 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
     ((window as any).__orchestrationThreadsCalls ??= []).push(ids);
     return machineRows(args.sessionId).filter(row => ids.includes(row.sessionId)) as T;
   }
-  if (command === 'orchestration_children') { (window as any).__orchestrationChildrenCalls = ((window as any).__orchestrationChildrenCalls ?? 0) + 1; return machineChildren(args.sessionId) as T; }
+  if (command === 'orchestration_children') { (window as any).__orchestrationChildrenCalls = ((window as any).__orchestrationChildrenCalls ?? 0) + 1; const wait = (window as any).__orchestrationChildrenDelay; if (wait) await new Promise(done => setTimeout(done, wait)); return machineChildren(args.sessionId) as T; }
   if (command.startsWith('orchestration_')) return invokeRemote<T>(command, args, emit);
   if (command === 'stop_session' && machineParents.has(args.sessionId)) machineStopped.add(args.sessionId);
   if (command === 'cloud_agent_targets') return previewCloud.agentTargets() as T;
@@ -1294,7 +1328,9 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
     }
     case 'archive_codex_task': { const task = codexTask(args.sessionId); assertIdle(task); task.archived = true; task.updatedAt = Date.now(); break; }
     case 'export_task': { const task = session(args.sessionId); result = `# ${task.title}\n\n` + (messages[task.id] ?? []).map(message => `## ${message.role}\n\n${message.content}\n\n`).join(''); break; }
-    case 'list_subagents': return [...(mirrorSubagents.get(String(args.sessionId))?.values() ?? [])] as T;
+    // Rows as `list_subagents` sends them: no tools and a short preview; the full one is `get_subagent`.
+    case 'list_subagents': return [...(mirrorSubagents.get(String(args.sessionId))?.values() ?? [])].map(saved => { const { tools, ...row } = saved as { prompt?: string; response?: string; tools?: unknown[] }; return { ...row, prompt: String(row.prompt ?? '').slice(0, 1025), response: String(row.response ?? '').slice(0, 1025), toolCount: tools?.length ?? 0 }; }) as T;
+    case 'get_subagent': return structuredClone(mirrorSubagents.get(String(args.sessionId))?.get(String(args.agentId)) ?? null) as T;
     case 'remote_team': return structuredClone(mirrorTeams.get(String(args.sessionId)) ?? null) as T;
     case 'remote_worker_messages': {
       // Pages of 40 back from the tail, as `worker_pages` in remote/mirror.rs joins the host's.
@@ -1432,7 +1468,7 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
       result = reordered.map(taskSummary); break;
     }
     case 'get_task': result = settleDraft(session(args.sessionId)); break;
-    case 'list_providers': result = args.deviceId ? remoteProviders() : providers; break;
+    case 'list_providers': if (args.force) ((window as any).__forcedProviderLists = ((window as any).__forcedProviderLists ?? 0) + 1); result = args.deviceId ? remoteProviders() : providers; break;
     case 'provider_check_connection': result = { installed: true, acpReady: true, sessionReady: true, state: 'ready', message: 'Sample connection check. No prompt sent.' }; break;
     case 'list_slash_commands': result = slashCatalog(session(args.sessionId).provider); break;
     case 'resolve_slash_command': result = resolveSlash(session(args.sessionId).provider, String(args.text)); break;
@@ -1459,6 +1495,14 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
     }
     case 'add_project': { const p = { id: crypto.randomUUID(), name: args.path.split('/').pop() || 'Project', path: args.path }; projects.push(p); result = p; break; }
     case 'remove_project': architect.remove(sessions.filter(s => s.projectId === args.projectId).map(s => s.id)); projects = projects.filter(p => p.id !== args.projectId); break;
+    case 'relink_project': {
+      const project = projects.find(p => p.id === args.projectId);
+      if (!project) throw new Error('Project not found.');
+      project.path = String(args.path ?? '');
+      // The located folder reads again, like the real relink.
+      (window as any).__filesFail = false;
+      result = { ...project, addedOrder: projects.indexOf(project) + 1 }; break;
+    }
     case 'delete_session': {
       const task = session(args.sessionId); assertIdle(task);
       if (architect.isActive(task.id)) throw new Error('Stop the team before deleting this task.');
@@ -1568,7 +1612,7 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
       if (s.taskStage === 'completed') throw new Error('Reopen this task before starting it.');
       const text = typeof args.text === 'string' ? args.text.trim() + moodboardContext : '';
       if (!text) throw new Error('Write a message first.');
-      if (new TextEncoder().encode(text).length > 128 * 1024) throw new Error('Message and attached context must be under 128 KiB.');
+      if (new TextEncoder().encode(text).length > MESSAGE_LIMIT) throw new Error('Message and attached context must be under 16 MiB.');
       s.status = 'running'; s.taskStage = 'in_progress'; s.completedAt = null; s.updatedAt = Date.now(); s.lastPromptAt = s.updatedAt; s.limitedAt = null; s.limitedUntil = null; s.resumeAtReset = false; if (s.title === 'New conversation') s.title = text.slice(0, 48); messages[s.id] ??= []; messages[s.id].push({ id: ++id, sessionId: s.id, role: 'user', content: text, createdAt: Date.now() });
       if (s.id === BRIEF_ID) { replayBrief(s); break; }
       agent({ sessionId: s.id, kind: 'status', text: 'Previewing response' });
@@ -1577,19 +1621,20 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
       messages[s.id].push(toolMessage);
       activeTools.set(s.id, { activity: tool, message: toolMessage });
       agent({ sessionId: s.id, kind: 'tool', text: 'Bash', tool: { ...tool } });
-      const output = 'This is the browser preview. Your task and conversation are saved in this preview session, but no agent or shell is running here.\n\nOpen the native PandaCode app to work with your files using Claude Code, Codex, or Kimi Code. The desktop app connects to the CLI tools installed on your machine.';
+      const output = shortReply ? 'All tests pass in the preview.' : 'This is the browser preview. Your task and conversation are saved in this preview session, but no agent or shell is running here.\n\nOpen the native PandaCode app to work with your files using Claude Code, Codex, or Kimi Code. The desktop app connects to the CLI tools installed on your machine.';
       let cursor = 0;
       const tick = () => {
         const next = output.slice(cursor, cursor + 13); cursor += 13;
         if (next.trim()) s.lastResponseAt = Date.now();
         agent({ sessionId: s.id, kind: 'text', text: next });
-        if (tool.status === 'running' && cursor >= 130) {
+        if (tool.status === 'running' && cursor >= (shortReply ? 13 : slowTurn ? 26 : 130)) {
           tool.status = 'completed'; tool.output = sampleTestOutput;
           toolMessage.content = encodeTool(tool);
           agent({ sessionId: s.id, kind: 'tool', text: 'Bash completed', tool: { ...tool } });
           activeTools.delete(s.id);
         }
-        if (cursor < output.length) timers.set(s.id, window.setTimeout(tick, 24)); else finish(s.id, output);
+        // ?slowturn streams at a real agent's pace: the command runs ~2 s, then the reply arrives a few words at a time.
+        if (cursor < output.length) timers.set(s.id, window.setTimeout(tick, shortReply ? 600 : slowTurn ? (cursor === 13 ? 2000 : 70) : 24)); else finish(s.id, output);
       };
       timers.set(s.id, window.setTimeout(tick, 200)); break;
     }
@@ -1840,7 +1885,11 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
     }
     // Any registry ID shows the yellow swatch; native reads browser-captures/<id>.png.
     case 'prompt_image': result = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(String(args.id)) ? 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==' : null; break;
+    // The preview browser exposes pasted images as files, so the native fallback only
+    // matters to tests, which provide the base64 through the invoke hook.
+    case 'read_clipboard_image': result = null; break;
     case 'reveal_path': if (!String(args.path ?? '').startsWith('/')) throw new Error('This attachment is no longer on this computer.'); break;
+    case 'dragged_file_paths': result = []; break;
     case 'read_document': {
       const path = String(args.path ?? ''), name = path.split('/').pop() || 'Document';
       if (!path.startsWith('/')) throw new Error('Choose the document with the picker or drop it onto the message.');

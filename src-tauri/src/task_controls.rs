@@ -614,6 +614,18 @@ pub(super) async fn rename_task(state: &AppState, sid: &str, title: &str) -> Res
         .update(sid, Some(title.into()), None, None, None)
 }
 
+/// Cursor's console needs the accepted program, so a cold start waits for the probe; the
+/// synchronous `harness_command` then finds the verdict. Every other harness returns at once.
+pub(super) async fn console_harness_ready(provider: &str) -> Result<Option<PathBuf>> {
+    if provider != "cursor" {
+        return Ok(None);
+    }
+    match crate::providers::cursor::accepted_executable().await {
+        Some(path) => Ok(Some(path)),
+        None => Err(terminal::INSTALL_BEFORE_CONSOLE.into()),
+    }
+}
+
 #[tauri::command]
 pub(super) async fn start_harness_terminal(
     app: tauri::AppHandle,
@@ -634,6 +646,7 @@ pub(super) async fn start_harness_terminal(
         let cwd = db.workspace_root(&task.project_id, Some(&session_id))?;
         (task, cwd)
     };
+    console_harness_ready(&task.provider).await?;
     if task.provider == "codex" {
         if let Some(remote) = task.resume_id.as_deref() {
             // A native CLI can change the persisted goal while PandaCode is idle.
@@ -796,6 +809,43 @@ mod command_tests {
             existing_codex_task(&store, "remote-existing").unwrap(),
             Some(task.id)
         );
+    }
+    fn cursor_probe(accept: bool) -> Arc<std::sync::atomic::AtomicUsize> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        crate::providers::cursor::set_probe_for_test(vec![PathBuf::from("/x/agent")], move |_| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if accept { Ok(json!({"protocolVersion":1,"authMethods":[{"id":"cursor_login"}]})) } else { Err("missing".into()) }
+        });
+        calls
+    }
+    // The probe tests hold `probe_test_guard()` on purpose.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn the_cursor_console_waits_for_the_probe_and_gets_the_accepted_path() {
+        let _guard = crate::providers::cursor::probe_test_guard();
+        let calls = cursor_probe(true);
+        assert_eq!(console_harness_ready("cursor").await, Ok(Some(PathBuf::from("/x/agent"))));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "exactly one handshake on accept");
+    }
+    // The probe tests hold `probe_test_guard()` on purpose.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn the_cursor_console_is_refused_only_after_the_probe_settles_not_installed() {
+        let _guard = crate::providers::cursor::probe_test_guard();
+        let calls = cursor_probe(false);
+        assert_eq!(console_harness_ready("cursor").await, Err(terminal::INSTALL_BEFORE_CONSOLE.to_owned()));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "the refusal waited for one handshake");
+    }
+    // The probe tests hold `probe_test_guard()` on purpose.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn another_harness_console_never_touches_the_cursor_probe() {
+        let _guard = crate::providers::cursor::probe_test_guard();
+        let calls = cursor_probe(true);
+        assert_eq!(console_harness_ready("claude").await, Ok(None));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "no handshake for another harness");
+        assert_eq!(crate::providers::cursor::cached_installed(), None, "no probe was started");
     }
     #[tokio::test]
     async fn preference_serialization_is_per_task_and_releases_on_cancellation() {

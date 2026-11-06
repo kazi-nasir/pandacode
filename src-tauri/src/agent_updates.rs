@@ -223,6 +223,10 @@ fn installed() -> Vec<Installation> {
         PROVIDERS
             .iter()
             .filter_map(|(id, name)| {
+                // Cursor has no update metadata, and looking it up would start its probe.
+                if *id == "cursor" {
+                    return None;
+                }
                 crate::providers::executable(id).map(|path| ((*id).into(), (*name).into(), path))
             })
             .collect(),
@@ -685,6 +689,24 @@ pub async fn update_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_never_asks_for_the_cursor_program_which_would_start_its_probe() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let _guard = crate::providers::cursor::probe_test_guard();
+        let probes = Arc::new(AtomicUsize::new(0));
+        let seen = probes.clone();
+        crate::providers::cursor::set_probe_for_test(vec![PathBuf::from("/x/agent")], move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({"protocolVersion":1,"authMethods":[{"id":"cursor_login"}]}))
+        });
+        let found = installed();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(found.iter().all(|install| install.provider != "cursor" && !install.providers.iter().any(|id| id == "cursor")));
+        assert_eq!(probes.load(Ordering::SeqCst), 0, "`providers::executable` would have started the probe");
+        assert_eq!(crate::providers::cursor::cached_installed(), None);
+    }
 
     #[test]
     fn parses_bounded_agent_versions_without_lexical_order_or_command_fragments() {

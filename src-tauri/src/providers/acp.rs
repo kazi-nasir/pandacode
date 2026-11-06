@@ -3,7 +3,7 @@
 use super::*;
 use crate::slash_commands::claude::Pipe;
 
-const DISCOVERY_STARTUP: Duration = Duration::from_secs(60);
+pub(super) const DISCOVERY_STARTUP: Duration = Duration::from_secs(60);
 const COMMAND_GRACE: Duration = Duration::from_secs(1);
 pub(crate) const ACP_STARTUP_TIMEOUT: &str = "ACP startup timed out after 60 seconds. Check the harness installation and sign-in, then refresh.";
 
@@ -73,10 +73,21 @@ pub(super) fn configure(command: &mut Command, config: &RunConfig) {
         "kilo" => super::kilo::configure(command),
         "devin" => super::devin::configure(command),
         "hermes" => super::hermes::configure(command, config),
+        "antigravity" => antigravity_args(command),
         _ => {
             #[cfg(target_os = "linux")]
             command.arg("--uid=");
         }
+    }
+}
+
+/// The standalone server takes no subcommand; the `agy` CLI fallback serves ACP from `acp`.
+pub(crate) fn antigravity_args(command: &mut Command) {
+    let program = Path::new(command.as_std().get_program());
+    if program.file_stem().is_some_and(|stem| stem.eq_ignore_ascii_case("agy")) {
+        command.arg("acp");
+    } else if cfg!(target_os = "linux") {
+        command.arg("--uid=");
     }
 }
 
@@ -134,6 +145,18 @@ pub(super) fn configuration(mode: &str) -> String {
     inline.to_string()
 }
 
+/// How much a harness's own mode ID approves without asking: 1 asks, 2 edits,
+/// 3 anything. A guess from the name, used only to refuse a fallback.
+fn mode_reach(id: &str) -> u8 {
+    let id = id.to_ascii_lowercase();
+    if ["bypass", "yolo", "full", "danger", "dont", "trust", "unsafe"].iter().any(|word| id.contains(word)) {
+        3
+    } else if ["accept", "auto", "edit"].iter().any(|word| id.contains(word)) {
+        2
+    } else {
+        1
+    }
+}
 pub(super) fn options<'a>(config: &'a Value, category: &str) -> Option<&'a Value> {
     let selects = || config["configOptions"].as_array().into_iter().flatten().take(64).filter(|option| option["type"] == "select");
     // An exact ID wins: Cline files its account `provider` option under the model category too.
@@ -192,12 +215,21 @@ impl Protocol {
     pub(super) fn acp(&mut self, value: Value) -> Result<Step, String> {
         let mut step = Step::default();
         let grok = self.config.provider == "grok";
+        let cursor = self.config.provider == "cursor";
         if self.acp_live_answered(&value, &mut step) {
             return Ok(step);
         }
         if value.get("error").is_some() {
             if self.config.provider == "github-copilot" && value["error"]["code"] == -32000 {
                 return Err("GitHub Copilot CLI requires sign-in. Run `copilot login` in a terminal, then retry.".into());
+            }
+            // The recorded signed-out error is -32602 with a login URL in its data, so any
+            // authenticate error is the fixed sentence, before `rpc_error` could print it.
+            if cursor && value["id"] == super::cursor::AUTHENTICATE_ID {
+                return Err(super::cursor::SIGN_IN_ERROR.into());
+            }
+            if cursor && value["id"] == 5 {
+                return Err(super::cursor::model_rejected(&self.config.model));
             }
             if grok && (value["id"] == 7 || value["error"]["code"] == -32000) {
                 return Err(GROK_SIGN_IN.into());
@@ -280,7 +312,7 @@ impl Protocol {
                     }
                     if self.mcp_server.is_some() && capabilities["mcpCapabilities"]["http"] != true
                     {
-                        if self.mcp_required {
+                        if self.mcp_required && !cursor {
                             return Err("This harness does not advertise HTTP MCP support required for PandaCode tools. Update its ACP server.".into());
                         }
                         // Title suggestions and host tools are optional capabilities.
@@ -303,7 +335,12 @@ impl Protocol {
                         }
                     };
                     let session = json!({"jsonrpc":"2.0","id":2,"method":method,"params":params});
-                    if grok {
+                    if cursor {
+                        // Cursor answers `authenticate` before any session call; a signed-out
+                        // CLI fails it at once (`signedout-*-acp.jsonl`).
+                        self.acp_pending_session = Some(session);
+                        step.write.push(json!({"jsonrpc":"2.0","id":super::cursor::AUTHENTICATE_ID,"method":"authenticate","params":{"methodId":super::cursor::LOGIN_METHOD}}));
+                    } else if grok {
                         // Grok Build wants an explicit authenticate before any session call,
                         // even with cached credentials. No cached method means no sign-in.
                         let method = cached_auth_method(result).ok_or(GROK_SIGN_IN)?;
@@ -377,6 +414,10 @@ impl Protocol {
         {
             self.acp_update_config(&value["params"]["update"]);
         }
+        if cursor && field(&value, "method").starts_with(super::cursor::EXTENSION_PREFIX) {
+            self.cursor_extension(&value, &mut step);
+            return Ok(step);
+        }
         if self.config.provider == "devin" && super::devin::subagent_usage(&value) {
             return Ok(step);
         }
@@ -391,6 +432,16 @@ impl Protocol {
             // ACP modes aren't universally approval policies. Keep user prompts
             // intact unless Full access, or Auto edits for an explicit edit call.
             let options = value["params"]["options"].as_array();
+            // As for Claude: a registered self-scoped tool can't touch the checkout.
+            if self.config.provider == "cline"
+                && super::cline::host_tool(field(&value["params"]["toolCall"], "title"))
+                    .is_some_and(|tool| super::self_scoped_host_tool(tool) && self.mcp_tool_names.contains(tool))
+            {
+                if let Some(allow) = options.and_then(|values| values.iter().find(|entry| entry["kind"] == "allow_once")) {
+                    step.write.push(json!({"jsonrpc":"2.0","id":value["id"],"result":{"outcome":{"outcome":"selected","optionId":allow["optionId"]}}}));
+                    return Ok(step);
+                }
+            }
             let deepseek = self.config.provider == "deepseek";
             let copilot = self.config.provider == "github-copilot";
             if self.config.provider == "kilo" {
@@ -464,6 +515,17 @@ impl Protocol {
                 }
                 return Ok(step);
             }
+            if cursor && self.config.mode == "plan" {
+                let tool = &value["params"]["toolCall"];
+                if let Some(choice) = super::cursor::plan_permission(field(tool, "kind"), options) {
+                    if choice.reject {
+                        let title = model_text(tool["title"].as_str(), "a state-changing action", 200);
+                        step.events.push(self.event("status", format!("Plan mode declined: {title}"), None));
+                    }
+                    step.write.push(super::cursor::selected_reply(&value["id"], &choice.option_id));
+                    return Ok(step);
+                }
+            }
             if self.config.provider == "hermes" && self.config.mode == "plan" {
                 let tool = &value["params"]["toolCall"];
                 let kind = field(tool, "kind");
@@ -494,10 +556,35 @@ impl Protocol {
                     return Ok(step);
                 }
             }
+            let allow_kind = if cursor { super::cursor::ONCE_ALLOW } else { "allow_once" };
+            if self.plan_fallback {
+                // The harness runs in its own mode, so PandaCode enforces the
+                // plan rules itself: reads pass, anything else is declined.
+                let tool = &value["params"]["toolCall"];
+                let read_only = matches!(field(tool, "kind"), "read" | "search" | "fetch" | "think");
+                let wanted = if read_only { "allow_once" } else { "reject_once" };
+                let choice = options.and_then(|values| values.iter().find(|entry| entry["kind"] == wanted));
+                if let Some(selected) = choice {
+                    if !read_only {
+                        let title = model_text(tool["title"].as_str().or_else(|| self.tools.get(field(tool, "toolCallId")).map(|t| t.name.as_str())), "a state-changing action", 200);
+                        step.events.push(self.event("status", format!("Plan mode declined: {title}"), None));
+                    }
+                    step.write.push(json!({"jsonrpc":"2.0","id":value["id"],"result":{"outcome":{"outcome":"selected","optionId":selected["optionId"]}}}));
+                    return Ok(step);
+                }
+                if !read_only {
+                    // A plan task must not turn an unrecognized ACP permission
+                    // request into a user-overridable write approval.
+                    step.write.push(json!({"jsonrpc":"2.0","id":value["id"],"result":{"outcome":{"outcome":"cancelled"}}}));
+                    return Ok(step);
+                }
+                // Read, search and fetch requests keep the ordinary approval
+                // path, as in Standard mode.
+            }
             let one_allow = options.is_some_and(|values| {
                 values
                     .iter()
-                    .filter(|entry| entry["kind"] == "allow_once")
+                    .filter(|entry| entry["kind"] == allow_kind)
                     .count()
                     == 1
             });
@@ -518,9 +605,26 @@ impl Protocol {
                 let selected = options
                     .unwrap()
                     .iter()
-                    .find(|entry| entry["kind"] == "allow_once")
+                    .find(|entry| entry["kind"] == allow_kind)
                     .unwrap();
                 step.write.push(json!({"jsonrpc":"2.0","id":value["id"],"result":{"outcome":{"outcome":"selected","optionId":selected["optionId"]}}}));
+                return Ok(step);
+            }
+            if cursor {
+                // Not answered above: the user's card decides. `kimi()` would read two
+                // once-allows as a structured question and cancel the request. With more or
+                // fewer than one once-allow, Approve must not guess between grants, so the
+                // stored request keeps none and `approve_reply` answers `cancelled`.
+                let mut request = value.clone();
+                if !one_allow {
+                    if let Some(offered) = request["params"]["options"].as_array_mut() {
+                        offered.retain(|entry| entry["kind"] != allow_kind);
+                    }
+                    step.events.push(self.event("status", "Cursor offered no single allow option, so Approve will grant nothing", None));
+                }
+                let tool = &value["params"]["toolCall"];
+                let label = model_text(tool["title"].as_str(), "Allow this agent action?", 200);
+                self.approval_capped(request, label, &mut step)?;
                 return Ok(step);
             }
         }
@@ -545,7 +649,7 @@ impl Protocol {
         }
     }
 
-    fn acp_startup_status(&self, step: &mut Step) {
+    fn acp_startup_status(&mut self, step: &mut Step) {
         let label = step.write.iter().find_map(|request| match field(request, "method") {
             "authenticate" => Some("Checking harness sign-in"),
             "session/new" => Some("Opening session"),
@@ -560,6 +664,12 @@ impl Protocol {
             "session/prompt" => Some("Waiting for response"),
             _ => None,
         });
+        if label == Some("Waiting for response") {
+            if let Some(note) = self.mode_note.take() {
+                step.events.push(self.event("status", note, None));
+                return;
+            }
+        }
         if let Some(label) = label { step.events.push(self.event("status", label, None)); }
     }
     /// Grok Build annotates every frame with the context it currently holds and
@@ -610,6 +720,19 @@ impl Protocol {
     fn acp_mode(&mut self, step: &mut Step) -> Result<(), String> {
         if matches!(self.config.provider.as_str(), "grok" | "deepseek") {
             // No session modes over ACP; plan mode lives in the permission policy.
+            return self.acp_model(step);
+        }
+        if self.config.provider == "cursor" {
+            match super::cursor::mode_request(&self.acp_config, &self.config.mode, &self.remote_id) {
+                super::cursor::ModeAction::Continue => {}
+                super::cursor::ModeAction::ContinueWithoutPlan => {
+                    step.events.push(self.event("status", super::cursor::PLAN_UNAVAILABLE, None));
+                }
+                super::cursor::ModeAction::SetMode(request) => {
+                    step.write.push(request);
+                    return Ok(());
+                }
+            }
             return self.acp_model(step);
         }
         let candidates: &[&str] = if self.config.provider == "commandcode" {
@@ -674,6 +797,9 @@ impl Protocol {
         } else {
             &["default", "ask", "code"]
         };
+        // On these harnesses the ACP mode is the approval policy, so a missing
+        // one must fail the run rather than silently widen access.
+        let permission_modes = matches!(self.config.provider.as_str(), "opencode" | "kilo" | "commandcode" | "cline" | "devin");
         if let Some(option) = options(&self.acp_config, "mode") {
             let found = candidates
                 .iter()
@@ -686,9 +812,10 @@ impl Protocol {
                     .push(choice_request(&self.remote_id, 4, option, id)?);
                 return Ok(());
             }
-            if self.config.mode == "plan" || matches!(self.config.provider.as_str(), "opencode" | "kilo" | "commandcode" | "cline" | "devin") {
+            if permission_modes {
                 return Err("This harness does not advertise the selected task mode.".into());
             }
+            self.mode_fallback()?;
         } else if let Some(modes) = self.acp_config["modes"]["availableModes"].as_array() {
             if let Some(mode) = candidates
                 .iter()
@@ -697,10 +824,13 @@ impl Protocol {
                 step.write.push(json!({"jsonrpc":"2.0","id":4,"method":"session/set_mode","params":{"sessionId":self.remote_id,"modeId":mode["id"]}}));
                 return Ok(());
             }
-            if self.config.mode == "plan" || matches!(self.config.provider.as_str(), "opencode" | "kilo" | "commandcode" | "cline" | "devin") {
+            if permission_modes {
                 return Err("This harness does not advertise the selected task mode.".into());
             }
+            self.mode_fallback()?;
         } else if self.config.mode == "plan" || matches!(self.config.provider.as_str(), "kilo" | "devin") {
+            // With no mode information at all (a bare resumed session, for
+            // instance) the run still fails rather than guess.
             return Err(if matches!(self.config.provider.as_str(), "kilo" | "devin") {
                 "This harness does not advertise the selected task mode."
             } else {
@@ -708,6 +838,37 @@ impl Protocol {
             }.into());
         }
         self.acp_model(step)
+    }
+    /// A generic harness without the selected mode keeps running in its own
+    /// mode, with a note naming that mode instead of a failed session (#269).
+    /// It never runs in a mode that approves more than the task allows, and a
+    /// plan task keeps its read-only rules on PandaCode's side.
+    fn mode_fallback(&mut self) -> Result<(), String> {
+        let (id, name) = match options(&self.acp_config, "mode") {
+            Some(option) => {
+                let id = field(option, "currentValue");
+                (id, choices(option).into_iter().find(|entry| entry["value"] == id).map_or("", |entry| field(entry, "name")))
+            }
+            None => {
+                let id = field(&self.acp_config["modes"], "currentModeId");
+                let modes = self.acp_config["modes"]["availableModes"].as_array();
+                (id, modes.and_then(|modes| modes.iter().find(|mode| mode["id"] == id)).map_or("", |mode| field(mode, "name")))
+            }
+        };
+        let current = model_text(Some(if name.is_empty() { id } else { name }), "default", 80);
+        let reach = mode_reach(id);
+        let chosen = match self.config.mode.as_str() { "plan" => 0, "auto" => 2, "full" => 3, _ => 1 };
+        let label = match chosen { 0 => "Plan", 2 => "Accept edits", 3 => "Full access", _ => "Standard" };
+        if reach > chosen.max(1) {
+            return Err(format!("This harness does not advertise a {label} mode, and its own mode ({current}) approves more than {label} allows."));
+        }
+        self.plan_fallback = chosen == 0;
+        self.mode_note = match chosen {
+            0 => Some(format!("This harness has no Plan mode; it runs in its {current} mode, and PandaCode asks for a plan and declines changes.")),
+            1 => None,
+            _ => Some(format!("This harness has no {label} mode; it runs in its {current} mode.")),
+        };
+        Ok(())
     }
     /// Devin keeps each setting on its saved session, so a resumed task skips
     /// the round trip for any value it already has.
@@ -726,7 +887,7 @@ impl Protocol {
         }
         let tool = self.tools.get(field(&value["params"]["toolCall"], "toolCallId"));
         let label = super::devin::approval_label(&value, tool);
-        self.approval(value, label, &mut step)?;
+        self.approval(value, label, &mut step);
         Ok(step)
     }
     fn acp_copilot_permissions(&mut self, step: &mut Step) -> Result<(), String> {
@@ -744,6 +905,20 @@ impl Protocol {
     fn acp_model(&mut self, step: &mut Step) -> Result<(), String> {
         if self.config.provider == "devin" && !self.image_blocks.is_empty() && super::devin::rejects_images(&self.acp_config, &self.config.model) {
             return Err("This Devin model does not accept images. Choose another model, or remove the images and describe them.".into());
+        }
+        if self.config.provider == "cursor" {
+            match super::cursor::model_request(&self.acp_config, &self.config.model, &self.remote_id) {
+                super::cursor::ModelAction::Applied => {}
+                super::cursor::ModelAction::SetModel(request) => {
+                    step.write.push(request);
+                    return Ok(());
+                }
+                super::cursor::ModelAction::Unconfirmed(current) => {
+                    let note = super::cursor::model_not_confirmed(&self.config.model, &current);
+                    step.events.push(self.event("status", note, None));
+                }
+            }
+            return self.acp_effort(step);
         }
         if self.config.model.is_empty() || self.config.model == "default" {
             return self.acp_effort(step);
@@ -891,8 +1066,7 @@ pub(super) async fn models(path: &Path) -> Result<Vec<ModelInfo>, String> {
     if let Some(models) = super::acp_catalog::get("antigravity", path) { return Ok(models); }
     let discovery = super::acp_catalog::begin("antigravity", path);
     let mut command = super::provider_command("antigravity", path)?;
-    #[cfg(target_os = "linux")]
-    command.arg("--uid=");
+    antigravity_args(&mut command);
     let _temp = super::AgentTemp::redirect(&mut command);
     let (metadata, _) = inspect(command, &std::env::temp_dir(), false).await?;
     super::acp_catalog::store(discovery, &metadata);
@@ -1093,15 +1267,14 @@ fn connection_status(result: Result<(Value, Option<Value>), DiscoveryFailure>) -
 pub async fn provider_check_connection(provider: String) -> Result<ConnectionStatus, String> {
     if provider != "antigravity" { return Err("Connection checks are supported for Antigravity ACP.".into()); }
     let Some(path) = super::executable(&provider).filter(|path| path.is_file()) else {
-        return Ok(ConnectionStatus { installed: false, acp_ready: false, session_ready: false, state: "missing", message: "Select the installed official Antigravity ACP server executable.".into() });
+        return Ok(ConnectionStatus { installed: false, acp_ready: false, session_ready: false, state: "missing", message: "Install the agy CLI or select the official Antigravity ACP server executable.".into() });
     };
     let command = match super::provider_command(&provider, &path) {
         Ok(command) => command,
         Err(message) => return Ok(connection_status(Err(DiscoveryFailure { acp_ready: false, authentication_required: false, message }))),
     };
     let mut command = command;
-    #[cfg(target_os = "linux")]
-    command.arg("--uid=");
+    antigravity_args(&mut command);
     let discovery = super::acp_catalog::begin("antigravity", &path);
     let _temp = super::AgentTemp::redirect(&mut command);
     let result = inspect_state(command, &std::env::temp_dir(), false, false, DISCOVERY_STARTUP, COMMAND_GRACE).await;
@@ -1109,7 +1282,6 @@ pub async fn provider_check_connection(provider: String) -> Result<ConnectionSta
     Ok(connection_status(result))
 }
 
-const MAX_STEER_BYTES: usize = 128 * 1024;
 const MAX_STEERS: usize = 16;
 /// Request ids for live steering prompts, clear of startup (1-7), cancel (900) and goals (10000+).
 const STEER_IDS: std::ops::Range<u64> = 2000..9000;
@@ -1139,8 +1311,8 @@ impl Protocol {
     pub(super) fn acp_steer(&mut self, id: String, text: String, reply: super::goals::RpcReply) -> Step {
         let mut step = Step::default();
         let text = text.trim().to_owned();
-        if text.is_empty() || text.len() > MAX_STEER_BYTES {
-            let _ = reply.send(Err("Write a steering message under 128 KiB.".into()));
+        if text.is_empty() || text.len() > crate::MESSAGE_LIMIT {
+            let _ = reply.send(Err("Write a steering message under 16 MiB.".into()));
             return step;
         }
         let steers = &mut self.acp_steers;
@@ -1230,6 +1402,26 @@ impl Protocol {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn antigravity_args_give_acp_only_to_the_agy_cli() {
+        let args = |program: &str| {
+            let mut command = tokio::process::Command::new(program);
+            super::antigravity_args(&mut command);
+            command.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>()
+        };
+        let mut agy = vec!["agy", "agy.exe", "AGY.EXE", "/usr/local/bin/agy", "/custom/dir/agy"];
+        if cfg!(windows) {
+            agy.push(r"C:\Program Files\Antigravity\agy.exe");
+        }
+        for program in agy {
+            assert_eq!(args(program), ["acp"], "{program}");
+        }
+        let server: &[&str] = if cfg!(target_os = "linux") { &["--uid="] } else { &[] };
+        for program in ["agy_acp_server.par", "agy_acp_server.exe", "/opt/agy_acp_server.par", "/opt/agy/server", "agy-wrapper"] {
+            assert_eq!(args(program), server, "{program}");
+        }
+    }
+
     use super::super::tests::config;
     use super::*;
 
@@ -1986,7 +2178,7 @@ mod tests {
         }
     }
     #[test]
-    fn unsupported_images_mcp_effort_or_plan_fail_before_any_prompt() {
+    fn unsupported_images_mcp_or_effort_fail_before_any_prompt() {
         let mut p = Protocol::new(config("antigravity"));
         p.image_blocks.push(json!({"type":"image"}));
         let mut cap = capabilities();
@@ -2005,6 +2197,90 @@ mod tests {
         let step = p.receive(cap).unwrap();
         assert_eq!(step.write[0]["method"], "session/new");
         assert_eq!(step.write[0]["params"]["mcpServers"], json!([]));
+        let mut cfg = config("opencode");
+        cfg.reasoning_effort = Some("ultra".into());
+        let mut p = Protocol::new(cfg);
+        p.acp_config = metadata();
+        p.remote_id = "remote".into();
+        assert!(p.receive(response(4, json!({}))).is_err());
+    }
+
+    #[test]
+    fn a_generic_harness_without_the_selected_mode_runs_in_its_own_mode() {
+        // A harness whose own modes lack a plan choice (#269) keeps the session
+        // alive and PandaCode enforces the read-only plan rules instead.
+        let mut cfg = config("antigravity");
+        cfg.mode = "plan".into();
+        let mut p = Protocol::new(cfg);
+        assert_eq!(p.initial()["method"], "initialize");
+        p.receive(capabilities()).unwrap();
+        let step = p.receive(response(2, json!({"sessionId":"remote","modes":{"currentModeId":"agent","availableModes":[{"id":"agent","name":"Agent"}]}}))).unwrap();
+        assert_eq!(step.write[0]["method"], "session/prompt");
+        assert!(step.write[0]["params"]["prompt"][0]["text"].as_str().unwrap().starts_with(READ_ONLY_PLAN_PREFIX));
+        assert!(step.events.iter().any(|event| event.kind == "status" && event.text.contains("no Plan mode; it runs in its Agent mode")));
+        let edit = json!({"jsonrpc":"2.0","id":"p1","method":"session/request_permission","params":{"sessionId":"remote","toolCall":{"title":"Edit src/main.rs","kind":"edit"},"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"reject","kind":"reject_once"}]}});
+        let declined = p.receive(edit).unwrap();
+        assert_eq!(declined.write[0]["result"]["outcome"]["optionId"], "reject");
+        assert!(declined.events.iter().any(|event| event.kind == "status" && event.text.contains("Plan mode declined")));
+        let read = json!({"jsonrpc":"2.0","id":"p2","method":"session/request_permission","params":{"sessionId":"remote","toolCall":{"title":"Read Cargo.toml","kind":"read"},"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"reject","kind":"reject_once"}]}});
+        assert_eq!(p.receive(read).unwrap().write[0]["result"]["outcome"]["optionId"], "allow");
+        // Reads without an allow option keep the ordinary approval path.
+        let fetch = json!({"jsonrpc":"2.0","id":"p4","method":"session/request_permission","params":{"sessionId":"remote","toolCall":{"title":"Fetch docs","kind":"fetch"},"options":[{"optionId":"always","kind":"allow_always"},{"optionId":"reject","kind":"reject_once"}]}});
+        let asked = p.receive(fetch).unwrap();
+        assert!(asked.write.is_empty());
+        assert!(asked.events.iter().any(|event| event.kind == "approval"));
+        let write_only = json!({"jsonrpc":"2.0","id":"p3","method":"session/request_permission","params":{"sessionId":"remote","toolCall":{"title":"Run deploy","kind":"execute"},"options":[{"optionId":"allow","kind":"allow_once"}]}});
+        assert_eq!(p.receive(write_only).unwrap().write[0]["result"]["outcome"]["outcome"], "cancelled");
+
+        // Hermes reaches the same fallback when its mode option lacks a
+        // counterpart; its own plan rules keep applying first.
+        let mut cfg = config("hermes");
+        cfg.mode = "plan".into();
+        let mut p = Protocol::new(cfg);
+        p.receive(capabilities()).unwrap();
+        let step = p.receive(response(2, json!({"sessionId":"remote","configOptions":[{"id":"mode","category":"mode","type":"select","currentValue":"chat","options":[{"value":"chat","name":"Chat"}]}]}))).unwrap();
+        assert_eq!(step.write[0]["method"], "session/prompt");
+        assert!(step.write[0]["params"]["prompt"][0]["text"].as_str().unwrap().starts_with(READ_ONLY_PLAN_PREFIX));
+        assert!(step.events.iter().any(|event| event.kind == "status" && event.text.contains("no Plan mode; it runs in its Chat mode")));
+        let read = json!({"jsonrpc":"2.0","id":"p5","method":"session/request_permission","params":{"sessionId":"remote","toolCall":{"title":"Read Cargo.toml","kind":"read"},"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"reject","kind":"reject_once"}]}});
+        assert_eq!(p.receive(read).unwrap().write[0]["result"]["outcome"]["optionId"], "allow");
+
+        // Accept edits runs in the harness's own mode with a status note and no plan prefix.
+        let mut cfg = config("antigravity");
+        cfg.mode = "auto".into();
+        let mut p = Protocol::new(cfg);
+        p.receive(capabilities()).unwrap();
+        let step = p.receive(response(2, json!({"sessionId":"remote","modes":{"currentModeId":"agent","availableModes":[{"id":"agent","name":"Agent"}]}}))).unwrap();
+        assert_eq!(step.write[0]["method"], "session/prompt");
+        assert!(step.write[0]["params"]["prompt"][0]["text"].as_str().unwrap().starts_with("Explain this project"));
+        assert!(step.events.iter().any(|event| event.kind == "status" && event.text.contains("Accept edits")));
+
+        // The same fallback applies when the harness advertises its modes as a
+        // mode option without a plan choice.
+        let mut cfg = config("antigravity");
+        cfg.mode = "plan".into();
+        let mut p = Protocol::new(cfg);
+        p.receive(capabilities()).unwrap();
+        let step = p.receive(response(2, json!({"sessionId":"remote","configOptions":[{"id":"mode","category":"mode","type":"select","currentValue":"agent","options":[{"value":"agent","name":"Agent"}]}]}))).unwrap();
+        assert_eq!(step.write[0]["method"], "session/prompt");
+        assert!(step.write[0]["params"]["prompt"][0]["text"].as_str().unwrap().starts_with(READ_ONLY_PLAN_PREFIX));
+        assert!(step.events.iter().any(|event| event.kind == "status" && event.text.contains("no Plan mode; it runs in its Agent mode")));
+
+        // A harness whose own mode approves more than the chosen one is never
+        // a fallback: Plan and Standard refuse an edit or bypass mode, Accept
+        // edits refuses a bypass mode, and Full access takes any.
+        for (mode, current, fails) in [("plan", "autoEdit", true), ("default", "yolo", true), ("auto", "accept-edits", false), ("auto", "bypassPermissions", true), ("full", "yolo", false)] {
+            let mut cfg = config("antigravity");
+            cfg.mode = mode.into();
+            let mut p = Protocol::new(cfg);
+            p.receive(capabilities()).unwrap();
+            let result = p.receive(response(2, json!({"sessionId":"remote","modes":{"currentModeId":current,"availableModes":[{"id":current}]}})));
+            assert_eq!(result.is_err(), fails, "{mode} in {current}");
+            if fails { assert!(result.err().unwrap().contains("approves more than")); }
+        }
+
+        // With no mode information at all the run still fails rather than
+        // guess what the harness would allow.
         let mut cfg = config("antigravity");
         cfg.mode = "plan".into();
         assert!(Protocol::new(cfg)
@@ -2012,12 +2288,14 @@ mod tests {
             .err()
             .unwrap()
             .contains("planning"));
+
+        // Harnesses whose modes are their approval policy still fail rather
+        // than widen access.
         let mut cfg = config("opencode");
-        cfg.reasoning_effort = Some("ultra".into());
+        cfg.mode = "plan".into();
         let mut p = Protocol::new(cfg);
-        p.acp_config = metadata();
-        p.remote_id = "remote".into();
-        assert!(p.receive(response(4, json!({}))).is_err());
+        p.receive(capabilities()).unwrap();
+        assert!(p.receive(response(2, json!({"sessionId":"remote","modes":{"availableModes":[{"id":"build"}]}}))).err().unwrap().contains("does not advertise the selected task mode"));
     }
     fn permission() -> Value {
         json!({"jsonrpc":"2.0","id":"p1","method":"session/request_permission","params":{"sessionId":"remote","toolCall":{"title":"Run command","kind":"execute"},"options":[{"optionId":"yes","kind":"allow_once"},{"optionId":"no","kind":"reject_once"}]}})
@@ -2141,6 +2419,9 @@ mod tests {
         let mut c = Command::new("agy_acp_server.par");
         configure(&mut c, &config("antigravity"));
         assert!(!c.as_std().get_args().any(|arg| arg == "acp"));
+        let mut c = Command::new("/usr/local/bin/agy");
+        configure(&mut c, &config("antigravity"));
+        assert_eq!(c.as_std().get_args().collect::<Vec<_>>(), ["acp"]);
         let mut c_hermes = Command::new("hermes");
         configure(&mut c_hermes, &config("hermes"));
         assert!(c_hermes.as_std().get_args().any(|arg| arg == "acp"));
@@ -2397,7 +2678,7 @@ mod tests {
     fn steers_are_bounded_and_validated() {
         let mut p = Protocol::new(config("deepseek"));
         assert!(acp_steer(&mut p, "a", "   ").1.is_err());
-        assert!(acp_steer(&mut p, "a", &"x".repeat(MAX_STEER_BYTES + 1)).1.is_err());
+        assert!(acp_steer(&mut p, "a", &"x".repeat(crate::MESSAGE_LIMIT + 1)).1.is_err());
         for n in 0..MAX_STEERS {
             acp_steer(&mut p, &n.to_string(), "ok").1.unwrap();
         }
@@ -2440,5 +2721,567 @@ mod tests {
         let step = p.receive(json!({"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}})).unwrap();
         assert!(!step.done);
         assert_eq!(step.write[0]["params"]["prompt"][0]["text"], "retry me");
+    }
+
+    // --- Cursor CLI ------------------------------------------------------------------
+    // Fixture-driven where recorded (`cursor_frames/`, see its NOTES.md). Frames built from
+    // `cursor_frames/extension-schemas.md` are schema-derived and not recorded.
+
+    const C_INITIALIZE: &str = include_str!("cursor_frames/initialize.jsonl");
+    const C_SESSION: &str = include_str!("cursor_frames/session.jsonl");
+    const C_RESUME: &str = include_str!("cursor_frames/resume.jsonl");
+    const C_MODEL_NEW: &str = include_str!("cursor_frames/model-new.jsonl");
+    const C_MODEL_LOAD: &str = include_str!("cursor_frames/model-load.jsonl");
+    const C_PLAN_LOAD: &str = include_str!("cursor_frames/plan-load.jsonl");
+    const C_PLAN_DENY: &str = include_str!("cursor_frames/plan-deny.jsonl");
+    const C_BADKEY: &str = include_str!("cursor_frames/signedout-badkey-acp.jsonl");
+    const C_NOKEY: &str = include_str!("cursor_frames/signedout-nokey-acp.jsonl");
+    const C_REPLAY_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+    /// Every frame of a recording, in order, with its direction.
+    fn c_entries(file: &str) -> Vec<(String, Value)> {
+        file.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|entry| entry.get("frame").is_some())
+            .map(|entry| (entry["dir"].as_str().unwrap().to_owned(), entry["frame"].clone()))
+            .collect()
+    }
+    /// The CLI's frames before the first `session/prompt` the driver sent. The recording
+    /// driver's own `session/set_mode` (its id 5) is left out.
+    fn c_boot(file: &str) -> Vec<Value> {
+        let mut frames = Vec::new();
+        for (dir, frame) in c_entries(file) {
+            if dir == "out" && frame["method"] == "session/prompt" {
+                break;
+            }
+            let driver_mode = (frame["id"] == 5 && frame.get("result").is_some()) || frame["params"]["update"]["sessionUpdate"] == "current_mode_update";
+            if dir == "in" && !driver_mode {
+                frames.push(frame);
+            }
+        }
+        frames
+    }
+    /// `c_boot` cut after the session result (a recording with no prompt carries the driver's
+    /// later requests too).
+    fn c_session(file: &str) -> Vec<Value> {
+        let mut frames = c_boot(file);
+        let end = frames.iter().position(|f| f["id"] == 2 && f.get("result").is_some()).unwrap();
+        frames.truncate(end + 1);
+        frames
+    }
+    /// The CLI's frames sent for the `nth` prompt (0-based), up to the next prompt.
+    fn c_turn(file: &str, nth: usize) -> Vec<Value> {
+        let mut seen = 0usize;
+        let mut frames = Vec::new();
+        for (dir, frame) in c_entries(file) {
+            if dir == "out" && frame["method"] == "session/prompt" {
+                seen += 1;
+                continue;
+            }
+            if seen == nth + 1 && dir == "in" {
+                frames.push(frame);
+            }
+        }
+        frames
+    }
+    fn c_config(mode: &str, model: &str) -> RunConfig {
+        let mut cfg = config("cursor");
+        cfg.mode = mode.into();
+        cfg.model = model.into();
+        cfg
+    }
+    fn c_load(mode: &str, model: &str) -> Protocol {
+        let mut cfg = c_config(mode, model);
+        cfg.resume_id = Some(C_REPLAY_ID.into());
+        Protocol::new(cfg)
+    }
+    /// Feeds frames, collecting every step; panics on a failure the test does not expect.
+    fn c_feed(p: &mut Protocol, frames: Vec<Value>) -> Vec<Step> {
+        frames.into_iter().map(|frame| p.receive(frame).unwrap()).collect()
+    }
+    fn c_methods(steps: &[Step]) -> Vec<String> {
+        steps.iter().flat_map(|step| step.write.iter()).map(|request| field(request, "method").to_owned()).collect()
+    }
+    fn c_statuses(steps: &[Step]) -> Vec<String> {
+        steps.iter().flat_map(|step| step.events.iter()).filter(|event| event.kind == "status").map(|event| event.text.clone()).collect()
+    }
+    fn c_option(id: &str, kind: &str, name: &str) -> Value {
+        json!({"optionId":id,"name":name,"kind":kind})
+    }
+    fn c_permission(kind: &str, options: Vec<Value>) -> Value {
+        json!({"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{"sessionId":C_REPLAY_ID,
+            "toolCall":{"toolCallId":"call-1","title":"Run command","kind":kind,"status":"pending"},"options":options}})
+    }
+    /// The recorded `execute` option list (`resume.jsonl`).
+    fn c_recorded_options() -> Vec<Value> {
+        vec![c_option("allow-once", "allow_once", "Allow once"), c_option("allow-always", "allow_always", "Allow always"), c_option("reject-once", "reject_once", "Reject")]
+    }
+    fn c_selected(step: &Step) -> String {
+        assert_eq!(step.write.len(), 1, "{:?}", step.write);
+        assert_eq!(step.write[0]["result"]["outcome"]["outcome"], "selected");
+        step.write[0]["result"]["outcome"]["optionId"].as_str().unwrap().to_owned()
+    }
+    fn c_approval_id(step: &Step) -> String {
+        step.events.iter().find(|e| e.kind == "approval").expect("approval card").request_id.clone().unwrap()
+    }
+
+    #[test]
+    fn cursor_initialize_authenticates_with_cursor_login_then_opens_the_session() {
+        let mut p = Protocol::new(c_config("ask", "default"));
+        assert_eq!(p.initial()["method"], "initialize");
+        let boot = c_boot(C_INITIALIZE);
+        assert!(super::super::cursor::identifies_cursor(&boot[0]["result"]));
+        let step = p.receive(boot[0].clone()).unwrap();
+        assert_eq!(step.write.len(), 1);
+        assert_eq!(step.write[0]["id"], 7);
+        assert_eq!(step.write[0]["method"], "authenticate");
+        assert_eq!(step.write[0]["params"]["methodId"], super::super::cursor::LOGIN_METHOD);
+        // The signed-in result (`authenticate.jsonl`) releases the stashed session request.
+        let step = p.receive(response(7, json!({}))).unwrap();
+        assert_eq!(step.write[0]["method"], "session/new");
+        assert_eq!(step.write[0]["id"], 2);
+        assert!(step.write[0]["params"]["mcpServers"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cursor_new_session_reads_modes_and_bracketed_models_then_prompts() {
+        let mut p = Protocol::new(c_config("ask", "default"));
+        let steps = c_feed(&mut p, c_boot(C_SESSION));
+        assert_eq!(c_methods(&steps), ["authenticate", "session/new", "session/prompt"], "Standard on the Agent mode sends no mode or model request");
+        assert!(!p.remote_id.is_empty());
+        assert_eq!(p.acp_config["modes"]["currentModeId"], "agent");
+        assert!(p.acp_config["models"]["availableModels"][0]["modelId"].as_str().unwrap().contains('['));
+        let prompt = steps.iter().flat_map(|step| step.write.iter()).find(|r| r["method"] == "session/prompt").unwrap();
+        assert_eq!(prompt["id"], 3);
+    }
+
+    #[test]
+    fn cursor_prompt_stream_renders_text_thinking_and_the_edit_tool_with_a_newline_in_its_id() {
+        let mut p = Protocol::new(c_config("ask", "default"));
+        c_feed(&mut p, c_boot(C_SESSION));
+        let frames = c_turn(C_SESSION, 0);
+        assert!(frames.iter().any(|f| field(&f["params"]["update"], "toolCallId").contains('\n')), "the recording's tool call id has a newline");
+        let frames_have_commands = frames.iter().any(|f| f["params"]["update"]["sessionUpdate"] == "available_commands_update");
+        let steps = c_feed(&mut p, frames);
+        let kinds = |kind: &str| steps.iter().flat_map(|s| s.events.iter()).filter(|e| e.kind == kind).count();
+        assert!(kinds("text") > 0);
+        assert!(kinds("thinking") > 0);
+        assert!(steps.iter().flat_map(|s| s.events.iter()).any(|e| e.kind == "tool" && e.text.contains("completed")));
+        assert!(frames_have_commands);
+        assert!(steps.iter().flat_map(|s| s.events.iter()).any(|e| e.kind == "commands_changed"), "the recorded available_commands_update reaches the composer");
+        assert!(steps.iter().all(|s| s.failure.is_none()));
+        assert!(steps.last().unwrap().done, "end_turn ends the turn");
+    }
+
+    #[test]
+    fn cursor_cancel_keeps_the_chunks_that_follow_then_ends_on_cancelled() {
+        let mut p = Protocol::new(c_config("ask", "default"));
+        c_feed(&mut p, c_boot(C_SESSION));
+        c_feed(&mut p, c_turn(C_SESSION, 0));
+        let mut frames = c_turn(C_SESSION, 1);
+        // The recording driver numbered this prompt 4; PandaCode's prompt is always id 3.
+        frames.last_mut().unwrap()["id"] = json!(3);
+        assert_eq!(frames.last().unwrap()["result"]["stopReason"], "cancelled");
+        let steps = c_feed(&mut p, frames);
+        assert!(steps.iter().flat_map(|s| s.events.iter()).any(|e| e.kind == "text"), "chunks after session/cancel still render");
+        assert!(steps.last().unwrap().done);
+        assert!(steps[..steps.len() - 1].iter().all(|s| !s.done));
+    }
+
+    #[test]
+    fn cursor_execute_permission_reaches_the_card_and_deny_selects_reject_once() {
+        let mut p = c_load("ask", "default");
+        c_feed(&mut p, c_boot(C_RESUME));
+        let frames = c_turn(C_RESUME, 0);
+        let index = frames.iter().position(|f| f["method"] == "session/request_permission").unwrap();
+        assert_eq!(frames[index]["id"], 0);
+        let before = c_feed(&mut p, frames[..index].to_vec());
+        assert!(before.iter().all(|s| s.write.is_empty()));
+        let step = p.receive(frames[index].clone()).unwrap();
+        assert!(step.write.is_empty(), "Standard asks");
+        let reply = p.approve(&c_approval_id(&step), false).unwrap();
+        assert_eq!(reply["id"], 0);
+        assert_eq!(reply["result"]["outcome"]["optionId"], "reject-once");
+    }
+
+    #[test]
+    fn cursor_resume_replay_adds_no_rows_and_keeps_the_saved_id() {
+        let mut p = c_load("ask", "default");
+        let boot = c_boot(C_RESUME);
+        let replay = boot.iter().filter(|f| f["method"] == "session/update").count();
+        assert!(replay >= 4);
+        let result = boot.iter().find(|f| f["id"] == 2).unwrap();
+        assert!(result["result"].get("sessionId").is_none(), "the recorded load result carries no sessionId");
+        let steps = c_feed(&mut p, boot);
+        assert_eq!(p.remote_id, C_REPLAY_ID);
+        for step in &steps {
+            assert!(step.events.iter().all(|e| !matches!(e.kind.as_str(), "text" | "thinking" | "tool")), "replay adds no transcript rows: {:?}", step.events);
+        }
+        assert_eq!(c_methods(&steps), ["authenticate", "session/load", "session/prompt"]);
+    }
+
+    #[test]
+    fn cursor_failed_load_is_a_resume_error_with_no_fresh_session() {
+        let mut p = c_load("ask", "default");
+        let steps = c_feed(&mut p, c_boot(C_RESUME)[..2].to_vec());
+        assert_eq!(c_methods(&steps), ["authenticate", "session/load"]);
+        let mut failed = c_entries(C_RESUME).into_iter().find(|(dir, f)| dir == "in" && f.get("error").is_some()).unwrap().1;
+        assert_eq!(failed["error"]["code"], -32602);
+        failed["id"] = json!(2); // the recording driver numbered its second load 8
+        let error = p.receive(failed).err().unwrap();
+        assert!(error.contains("session creation or resume"), "{error}");
+    }
+
+    #[test]
+    fn cursor_plan_accept_and_todos_round_trip() {
+        let mut p = c_load("plan", "default");
+        let steps = c_feed(&mut p, c_boot(C_PLAN_LOAD));
+        let set = steps.iter().flat_map(|s| s.write.iter()).find(|r| r["method"] == "session/set_mode").expect("Plan id advertised, current agent");
+        assert_eq!(set["id"], 4);
+        assert_eq!(set["params"]["modeId"], "plan");
+        // The mode result (id 4) goes on to the prompt.
+        let step = p.receive(response(4, json!({}))).unwrap();
+        assert_eq!(step.write[0]["method"], "session/prompt");
+        // The first recorded turn raises `cursor/create_plan`.
+        let frames = c_turn(C_PLAN_LOAD, 0);
+        let index = frames.iter().position(|f| f["method"] == "cursor/create_plan").unwrap();
+        c_feed(&mut p, frames[..index].to_vec());
+        let step = p.receive(frames[index].clone()).unwrap();
+        let card = step.events.iter().find(|e| e.kind == "approval").unwrap();
+        assert!(card.text.contains("Accept this plan?"), "{}", card.text);
+        assert!(step.events.iter().any(|e| e.kind == "text"), "plan Markdown renders");
+        let reply = p.approve(card.request_id.as_deref().unwrap(), true).unwrap();
+        assert_eq!(reply["result"], json!({"outcome":{"outcome":"accepted"}}));
+        // `cursor/update_todos` (a request with an id, recorded in the fourth turn).
+        let todo = c_turn(C_PLAN_LOAD, 3).into_iter().find(|f| f["method"] == "cursor/update_todos").unwrap();
+        let step = p.receive(todo.clone()).unwrap();
+        assert_eq!(step.write[0]["id"], todo["id"]);
+        assert_eq!(step.write[0]["result"]["outcome"]["outcome"], "accepted");
+        assert_eq!(step.write[0]["result"]["outcome"]["todos"][0]["id"], "record-shapes");
+        assert!(step.events.iter().any(|e| e.kind == "tool"));
+        assert!(!p.cursor_todos.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cursor_plan_deny_sends_the_recorded_rejected_body_and_stop_does_the_same() {
+        let mut p = c_load("plan", "grok-4.7-high-fast");
+        c_feed(&mut p, c_boot(C_PLAN_DENY));
+        let recorded: Value = serde_json::from_str(C_PLAN_DENY.lines().next().unwrap()).unwrap();
+        let plan = c_turn(C_PLAN_DENY, 0).into_iter().find(|f| f["method"] == "cursor/create_plan").unwrap();
+        let step = p.receive(plan.clone()).unwrap();
+        let reply = p.approve(&c_approval_id(&step), false).unwrap();
+        assert_eq!(reply["result"], recorded["denyBody"]);
+        // Stop with a pending plan declines through the same body, not `cancelled`.
+        let step = p.receive(plan).unwrap();
+        assert_eq!(step.events.iter().filter(|e| e.kind == "approval").count(), 1);
+        let stopped = p.cancel_requests();
+        assert_eq!(stopped.write.len(), 1);
+        assert_eq!(stopped.write[0]["result"], recorded["denyBody"]);
+    }
+
+    #[test]
+    fn cursor_model_requests_follow_the_recorded_session_results() {
+        // `model-load.jsonl` / `plan-deny.jsonl`: `--model` already applied by choice name or family.
+        for (file, model, mode) in [(C_MODEL_LOAD, "composer-2.5", "ask"), (C_PLAN_DENY, "grok-4.7-high-fast", "plan")] {
+            let mut p = c_load(mode, model);
+            let mut steps = c_feed(&mut p, c_boot(file));
+            // A chat left in another mode is first switched (client id 4), then goes on.
+            if c_methods(&steps).last().unwrap() == "session/set_mode" {
+                steps.push(p.receive(response(4, json!({}))).unwrap());
+            }
+            let methods = c_methods(&steps);
+            assert!(!methods.contains(&"session/set_config_option".to_owned()), "{model}: {methods:?}");
+            assert!(!methods.contains(&"session/set_model".to_owned()));
+            assert_eq!(methods.last().unwrap(), "session/prompt");
+        }
+        // `model-new.jsonl`: the same family match on `session/new`.
+        let mut p = Protocol::new(c_config("ask", "grok-4.7-high-fast"));
+        assert_eq!(c_methods(&c_feed(&mut p, c_session(C_MODEL_NEW))), ["authenticate", "session/new", "session/prompt"]);
+        // A task on `composer-2.5` fed that same result sets the bracketed value with id 5.
+        let mut p = Protocol::new(c_config("ask", "composer-2.5"));
+        let steps = c_feed(&mut p, c_session(C_MODEL_NEW));
+        let set = steps.iter().flat_map(|s| s.write.iter()).find(|r| r["method"] == "session/set_config_option").unwrap();
+        assert_eq!(set["id"], 5);
+        assert_eq!(set["params"]["configId"], "model");
+        assert_eq!(set["params"]["value"], "composer-2.5[fast=true]");
+        let recorded = c_entries(C_MODEL_NEW).into_iter().find(|(dir, f)| dir == "in" && f["id"] == 5).unwrap().1;
+        let step = p.receive(recorded).unwrap();
+        assert_eq!(step.write[0]["method"], "session/prompt", "the recorded id 5 result continues to the prompt");
+        // The recorded bare-slug error, as the answer to id 5, fails the turn with MODEL_REJECTED.
+        let mut p = Protocol::new(c_config("ask", "gpt-5.3-codex-high"));
+        c_feed(&mut p, c_session(C_MODEL_NEW));
+        let mut rejected = c_entries(C_MODEL_NEW).into_iter().find(|(dir, f)| dir == "in" && f["error"]["code"] == -32602).unwrap().1;
+        rejected["id"] = json!(5);
+        let error = p.receive(rejected).err().unwrap();
+        assert_eq!(error, super::super::cursor::model_rejected("gpt-5.3-codex-high"));
+        // A slug that is neither applied nor settable says so and still reaches the prompt.
+        let mut p = Protocol::new(c_config("ask", "no-such-model"));
+        let steps = c_feed(&mut p, c_session(C_MODEL_NEW));
+        assert_eq!(c_methods(&steps).last().unwrap(), "session/prompt");
+        assert!(c_statuses(&steps).iter().any(|s| s.contains("no-such-model") && s.contains("did not confirm")));
+    }
+
+    #[test]
+    fn cursor_plan_mode_rule_over_recorded_session_results() {
+        // Already Plan (`plan-deny.jsonl` loads a chat in plan): no set_mode, prompt follows.
+        let mut p = c_load("plan", "default");
+        assert_eq!(c_methods(&c_feed(&mut p, c_boot(C_PLAN_DENY))), ["authenticate", "session/load", "session/prompt"]);
+        // No Plan id listed: no set_mode, one PLAN_UNAVAILABLE status before the prompt, and no stop.
+        let mut result = c_boot(C_SESSION).into_iter().find(|f| f["id"] == 2).unwrap();
+        result["result"]["modes"]["availableModes"] = json!([{"id":"agent","name":"Agent"},{"id":"ask","name":"Ask"}]);
+        result["result"]["configOptions"] = json!([]);
+        let mut p = Protocol::new(c_config("plan", "default"));
+        p.receive(c_boot(C_SESSION)[0].clone()).unwrap();
+        p.receive(response(7, json!({}))).unwrap();
+        let step = p.receive(result.clone()).unwrap();
+        assert_eq!(step.write.len(), 1);
+        assert_eq!(step.write[0]["method"], "session/prompt");
+        assert_eq!(c_statuses(&[step]).into_iter().filter(|s| s == super::super::cursor::PLAN_UNAVAILABLE).count(), 1);
+        // No modes at all, in Plan: still the prompt.
+        let mut bare = result;
+        bare["result"].as_object_mut().unwrap().remove("modes");
+        let mut p = Protocol::new(c_config("plan", "default"));
+        p.receive(c_boot(C_SESSION)[0].clone()).unwrap();
+        p.receive(response(7, json!({}))).unwrap();
+        assert_eq!(p.receive(bare).unwrap().write[0]["method"], "session/prompt");
+        // A resumed chat left in `ask`, run in Standard, switches to the Agent id (client id 4).
+        let mut ask = c_boot(C_RESUME).into_iter().find(|f| f["id"] == 2).unwrap();
+        ask["result"]["modes"]["currentModeId"] = json!("ask");
+        ask["result"]["configOptions"] = json!([]);
+        let mut p = c_load("ask", "default");
+        p.receive(c_boot(C_RESUME)[0].clone()).unwrap();
+        p.receive(response(7, json!({}))).unwrap();
+        let step = p.receive(ask.clone()).unwrap();
+        assert_eq!(step.write[0]["method"], "session/set_mode");
+        assert_eq!(step.write[0]["id"], 4);
+        assert_eq!(step.write[0]["params"]["modeId"], "agent");
+        // Only `ask` and `plan` advertised: nothing selected, the prompt still goes out.
+        ask["result"]["modes"]["availableModes"] = json!([{"id":"ask","name":"Ask"},{"id":"plan","name":"Plan"}]);
+        let mut p = c_load("ask", "default");
+        p.receive(c_boot(C_RESUME)[0].clone()).unwrap();
+        p.receive(response(7, json!({}))).unwrap();
+        assert_eq!(p.receive(ask).unwrap().write[0]["method"], "session/prompt");
+    }
+
+    #[test]
+    fn cursor_mode_updates_do_not_end_the_turn() {
+        let mut p = Protocol::new(c_config("plan", "default"));
+        c_feed(&mut p, c_boot(C_SESSION));
+        for update in [
+            json!({"sessionUpdate":"current_mode_update","currentModeId":"agent"}),
+            json!({"sessionUpdate":"config_option_update","configOptions":[{"id":"mode","type":"select","currentValue":"agent","options":[{"value":"agent","name":"Agent"}]}]}),
+        ] {
+            let step = p.receive(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":p.remote_id,"update":update}})).unwrap();
+            assert!(step.failure.is_none());
+            assert!(!step.done);
+        }
+        assert_eq!(p.acp_config["configOptions"][0]["currentValue"], "agent", "config option updates are still stored");
+    }
+
+    #[test]
+    fn cursor_authenticate_errors_are_the_fixed_sign_in_sentence_without_the_login_url() {
+        for file in [C_BADKEY, C_NOKEY] {
+            let mut p = Protocol::new(c_config("ask", "default"));
+            let error_frame = c_entries(file).into_iter().find(|(dir, f)| dir == "in" && f["id"] == 7).unwrap().1;
+            assert_eq!(error_frame["error"]["code"], -32602);
+            p.receive(c_boot(file)[0].clone()).unwrap();
+            let error = p.receive(error_frame).err().unwrap();
+            assert_eq!(error, super::super::cursor::SIGN_IN_ERROR);
+            assert!(!error.contains("http") && !error.contains("login-url") && !error.contains("Failed to open browser"));
+        }
+        // Any other code is the same sentence.
+        let mut p = Protocol::new(c_config("ask", "default"));
+        let error = p.receive(json!({"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"x"}})).err().unwrap();
+        assert_eq!(error, super::super::cursor::SIGN_IN_ERROR);
+    }
+
+    #[tokio::test]
+    // The probe tests hold `probe_test_guard()` (a std mutex) for the whole test on purpose.
+    #[allow(clippy::await_holding_lock)]
+    async fn cursor_sign_in_failure_keeps_installed() {
+        let _guard = super::super::cursor::probe_test_guard();
+        let path = PathBuf::from("/opt/cursor/agent");
+        let expected = path.clone();
+        super::super::cursor::set_probe_for_test(vec![path.clone()], move |candidate| {
+            assert_eq!(candidate, expected);
+            Ok(c_boot(C_INITIALIZE)[0]["result"].clone())
+        });
+        assert_eq!(super::super::cursor::accepted_executable().await, Some(path.clone()));
+        for file in [C_BADKEY, C_NOKEY] {
+            let mut p = Protocol::new(c_config("ask", "default"));
+            p.receive(c_boot(file)[0].clone()).unwrap();
+            let error_frame = c_entries(file).into_iter().find(|(dir, f)| dir == "in" && f["id"] == 7).unwrap().1;
+            assert_eq!(p.receive(error_frame).err().unwrap(), super::super::cursor::SIGN_IN_ERROR);
+            assert_eq!(super::super::cursor::cached_installed(), Some(path.clone()));
+        }
+        let row = discover().into_iter().find(|provider| provider.id == "cursor").unwrap();
+        assert!(row.installed);
+        assert_eq!(row.path.as_deref(), Some(path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn cursor_without_http_mcp_continues_with_no_host_even_when_required() {
+        let host = json!({"type":"http","name":"pandacode","url":"http://127.0.0.1:1/mcp","headers":[]});
+        let mut p = Protocol::new(c_config("ask", "default"));
+        p.mcp_server = Some(host.clone());
+        p.mcp_required = true;
+        let mut init = c_boot(C_INITIALIZE)[0].clone();
+        init["result"]["agentCapabilities"]["mcpCapabilities"] = json!({"http":false});
+        p.receive(init).unwrap();
+        let step = p.receive(response(7, json!({}))).unwrap();
+        assert_eq!(step.write[0]["method"], "session/new");
+        assert!(step.write[0]["params"]["mcpServers"].as_array().unwrap().is_empty());
+        // Advertised HTTP is offered (`mcp-load.jsonl`: no permission request, no --approve-mcps).
+        let mut p = Protocol::new(c_config("ask", "default"));
+        p.mcp_server = Some(host);
+        p.receive(c_boot(C_INITIALIZE)[0].clone()).unwrap();
+        let step = p.receive(response(7, json!({}))).unwrap();
+        assert_eq!(step.write[0]["params"]["mcpServers"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cursor_resume_without_load_or_resume_support_is_refused() {
+        let mut init = c_boot(C_INITIALIZE)[0].clone();
+        init["result"]["agentCapabilities"]["loadSession"] = json!(false);
+        let mut p = c_load("ask", "default");
+        let error = p.receive(init).err().unwrap();
+        assert!(error.contains("cannot resume"), "{error}");
+    }
+
+    #[test]
+    fn cursor_once_pair_is_shared() {
+        use super::super::cursor::{ONCE_ALLOW, ONCE_REJECT};
+        assert_eq!(ONCE_ALLOW, "allow_once");
+        assert_eq!(ONCE_REJECT, "reject_once");
+        let by_kind = |options: &[Value], kind: &str| options.iter().find(|o| o["kind"] == kind).unwrap()["optionId"].as_str().unwrap().to_owned();
+        let all = c_recorded_options();
+        let allow = by_kind(&all, ONCE_ALLOW);
+        let reject = by_kind(&all, ONCE_REJECT);
+        let single = vec![c_option("allow-once", ONCE_ALLOW, "Allow once"), c_option("reject-once", ONCE_REJECT, "Reject")];
+        let ready = |mode: &str| {
+            let mut p = Protocol::new(c_config(mode, "default"));
+            p.remote_id = C_REPLAY_ID.into();
+            p
+        };
+        // (1) The card: Approve and Deny choose the once options, never allow-always.
+        let mut p = ready("ask");
+        let step = p.receive(c_permission("execute", all.clone())).unwrap();
+        assert_eq!(p.approve(&c_approval_id(&step), true).unwrap()["result"]["outcome"]["optionId"], allow);
+        let step = p.receive(c_permission("execute", all.clone())).unwrap();
+        assert_eq!(p.approve(&c_approval_id(&step), false).unwrap()["result"]["outcome"]["optionId"], reject);
+        // (2) Accept edits: an `edit` with a single once-allow is answered in-process.
+        let step = ready("auto").receive(c_permission("edit", single.clone())).unwrap();
+        assert_eq!(c_selected(&step), allow);
+        let step = ready("auto").receive(c_permission("execute", single.clone())).unwrap();
+        assert!(step.write.is_empty(), "only edits are automatic");
+        // (3) Plan: read is allowed once, execute is rejected once (with the status line).
+        let step = ready("plan").receive(c_permission("read", all.clone())).unwrap();
+        assert_eq!(c_selected(&step), allow);
+        let step = ready("plan").receive(c_permission("execute", all.clone())).unwrap();
+        assert_eq!(c_selected(&step), reject);
+        assert!(step.events.iter().any(|e| e.kind == "status" && e.text.starts_with("Plan mode declined")));
+        // A Plan request with no matching option shows the card.
+        let step = ready("plan").receive(c_permission("execute", vec![c_option("allow-once", ONCE_ALLOW, "Allow once")])).unwrap();
+        assert!(step.events.iter().any(|e| e.kind == "approval"));
+        // (4) Full: a single once-allow on any kind.
+        let step = ready("full").receive(c_permission("execute", single)).unwrap();
+        assert_eq!(c_selected(&step), allow);
+    }
+
+    /// An unanswered Cursor permission shows exactly one card and writes nothing yet; Deny
+    /// selects the once-reject, and Approve grants nothing when the once-allow is ambiguous.
+    fn c_card_only(mode: &str, kind: &str, options: Vec<Value>, deny: Option<&str>) {
+        let mut p = Protocol::new(c_config(mode, "default"));
+        p.remote_id = C_REPLAY_ID.into();
+        let step = p.receive(c_permission(kind, options.clone())).unwrap();
+        assert_eq!(step.events.iter().filter(|e| e.kind == "approval").count(), 1, "{:?}", step.events);
+        assert!(step.write.is_empty(), "no JSON-RPC write yet: {:?}", step.write);
+        assert!(step.events.iter().all(|e| e.kind != "status" || e.text.starts_with("Cursor offered no single")), "not the structured-input note");
+        let id = c_approval_id(&step);
+        let approved = p.approve(&id, true).unwrap();
+        assert_eq!(approved["result"]["outcome"]["outcome"], "cancelled", "Approve never guesses between grants");
+        // Deny of a second, identical request.
+        let step = p.receive(c_permission(kind, options)).unwrap();
+        let denied = p.approve(&c_approval_id(&step), false).unwrap();
+        match deny {
+            Some(option) => assert_eq!(denied["result"]["outcome"]["optionId"], option),
+            None => assert_eq!(denied["result"]["outcome"]["outcome"], "cancelled"),
+        }
+        assert_eq!(p.cancel()["method"], "session/cancel");
+    }
+
+    #[test]
+    fn cursor_two_once_allows_show_the_card_instead_of_cancelling() {
+        use super::super::cursor::{ONCE_ALLOW, ONCE_REJECT};
+        let two = vec![c_option("allow-1", ONCE_ALLOW, "Allow once"), c_option("allow-2", ONCE_ALLOW, "Allow this once"), c_option("reject-once", ONCE_REJECT, "Reject")];
+        // Full, and Accept edits on an edit tool, would auto-select a single once-allow.
+        c_card_only("full", "execute", two.clone(), Some("reject-once"));
+        c_card_only("auto", "edit", two.clone(), Some("reject-once"));
+        // Plan with no once-reject falls through to the card, and Deny has nothing to select.
+        let no_reject = vec![c_option("allow-1", ONCE_ALLOW, "Allow once"), c_option("allow-2", ONCE_ALLOW, "Allow this once")];
+        c_card_only("plan", "execute", no_reject, None);
+        // A `q<n>_opt_` id is a card too for Cursor, never a cancelled question.
+        let question = vec![c_option("q0_opt_a", ONCE_ALLOW, "Allow once"), c_option("reject-once", ONCE_REJECT, "Reject")];
+        let mut p = Protocol::new(c_config("full", "default"));
+        p.remote_id = C_REPLAY_ID.into();
+        let step = p.receive(c_permission("execute", question)).unwrap();
+        assert!(step.write.is_empty());
+        assert!(step.events.iter().any(|e| e.kind == "approval"));
+    }
+
+    // The frames below are built from `cursor_frames/extension-schemas.md`: schema-derived,
+    // not recorded.
+    fn ask_question(id: u64, count: usize) -> Value {
+        let questions: Vec<Value> = (0..count)
+            .map(|n| json!({"id":format!("q{n}"),"prompt":format!("Pick {n}"),"options":[{"id":"a","label":"Alpha"},{"id":"b","label":"Beta"}]}))
+            .collect();
+        json!({"jsonrpc":"2.0","id":id,"method":"cursor/ask_question","params":{"toolCallId":"tc-1","title":"Choose","questions":questions}})
+    }
+
+    #[test]
+    fn cursor_malformed_ask_question_through_acp_routing_fails_once_and_visibly() {
+        let mut p = Protocol::new(c_config("ask", "default"));
+        p.remote_id = C_REPLAY_ID.into();
+        let step = p.acp(ask_question(9, 4)).unwrap();
+        assert_eq!(step.write.len(), 1);
+        assert_eq!(step.write[0]["error"]["code"], -32602);
+        assert_eq!(step.write[0]["id"], 9);
+        let statuses: Vec<_> = step.events.iter().filter(|e| e.kind == "status").collect();
+        assert_eq!(statuses.len(), 1);
+        assert!(statuses[0].text.starts_with(super::super::cursor::QUESTION_REFUSED));
+        assert!(step.events.iter().all(|e| e.kind != "input_request"));
+        assert!(p.inputs.is_empty());
+    }
+
+    #[test]
+    fn cursor_question_round_trips_and_stop_cancels_it() {
+        let mut p = Protocol::new(c_config("ask", "default"));
+        p.remote_id = C_REPLAY_ID.into();
+        let step = p.acp(ask_question(9, 1)).unwrap();
+        let request = step.events.iter().find(|e| e.kind == "input_request").unwrap().request_id.clone().unwrap();
+        let reply = p.cursor_user_input(&request, json!({"answers":{"q0":["Beta"]}})).unwrap();
+        assert_eq!(reply.write[0]["id"], 9);
+        assert_eq!(reply.write[0]["result"]["outcome"]["outcome"], "answered");
+        assert_eq!(reply.write[0]["result"]["outcome"]["answers"][0]["selectedOptionIds"], json!(["b"]));
+        let step = p.acp(ask_question(10, 1)).unwrap();
+        assert_eq!(step.events.iter().filter(|e| e.kind == "input_request").count(), 1);
+        let stopped = p.cancel_requests();
+        assert_eq!(stopped.write.len(), 1);
+        assert_eq!(stopped.write[0]["id"], 10);
+        assert_eq!(stopped.write[0]["result"]["outcome"]["outcome"], "cancelled");
+    }
+
+    #[test]
+    fn cursor_task_and_generate_image_get_a_bare_success_only_with_an_id() {
+        let mut p = Protocol::new(c_config("ask", "default"));
+        p.remote_id = C_REPLAY_ID.into();
+        for method in ["cursor/task", "cursor/generate_image"] {
+            let step = p.acp(json!({"jsonrpc":"2.0","id":4,"method":method,"params":{"toolCallId":"t"}})).unwrap();
+            assert_eq!(step.write, vec![json!({"jsonrpc":"2.0","id":4,"result":{}})], "{method}");
+            let step = p.acp(json!({"jsonrpc":"2.0","method":method,"params":{"toolCallId":"t"}})).unwrap();
+            assert!(step.write.is_empty(), "{method} notification");
+        }
+        let step = p.acp(json!({"jsonrpc":"2.0","id":5,"method":"cursor/unknown","params":{}})).unwrap();
+        assert_eq!(step.write[0]["error"]["code"], -32601);
     }
 }

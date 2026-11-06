@@ -2,6 +2,7 @@
 mod acp;
 pub(crate) mod claude;
 mod codex;
+mod deepseek;
 mod kimi;
 mod muse;
 mod pi;
@@ -65,6 +66,10 @@ struct CommandCache {
 
 static CACHE: LazyLock<Mutex<CommandCache>> = LazyLock::new(|| Mutex::new(CommandCache::default()));
 static DISCOVERY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+/// Test-only count of discoveries that would start an ACP process, so a harness whose
+/// command list must never be probed (Cursor) can assert that `acp::discover` was unreached.
+#[cfg(test)]
+static ACP_DISCOVERIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const CACHE_AGE: Duration = Duration::from_secs(300);
 /// Untouched entries are dropped after this long. Longer than `CACHE_AGE` so a
 /// stale snapshot still serves completion while a refresh is pending.
@@ -195,7 +200,7 @@ impl CommandCache {
                 // Process output stays behind the generic message.
                 let warning = if key.0 == "kimi" && error == kimi::AUTH_REQUIRED {
                     kimi::AUTH_REQUIRED
-                } else if matches!(key.0.as_str(), "opencode" | "antigravity" | "grok" | "commandcode" | "cline" | "kilo" | "github-copilot" | "devin" | "hermes")
+                } else if matches!(key.0.as_str(), "opencode" | "antigravity" | "grok" | "commandcode" | "cline" | "kilo" | "github-copilot" | "devin" | "hermes" | "cursor")
                     && error.starts_with(crate::providers::acp::ACP_STARTUP_TIMEOUT)
                 {
                     crate::providers::acp::ACP_STARTUP_TIMEOUT
@@ -349,6 +354,7 @@ fn validate_provider(provider: &str) -> Result<(), String> {
             | "muse"
             | "devin"
             | "hermes"
+            | "cursor"
     ) {
         return Err("Unknown harness.".into());
     }
@@ -372,9 +378,12 @@ async fn discover_catalog(provider: &str, cwd: &Path, key: Key, started: Instant
             "claude" => claude::discover(cwd).await,
             "glm" | "mimo" => claude::discover_for(provider, cwd).await,
             "opencode" | "antigravity" | "grok" | "commandcode" | "cline" | "kilo" | "github-copilot" | "devin" | "hermes" => {
+                #[cfg(test)]
+                let _ = ACP_DISCOVERIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 acp::discover(provider, cwd).await
             }
-            "deepseek" => Ok(Catalog::default()),
+            "deepseek" => deepseek::discover(cwd),
+            "cursor" => Ok(Catalog::default()),
             "codex" => codex::discover(cwd).await,
             "kimi" => kimi::discover(cwd).await,
             "pi" | "omp" => pi::discover(provider, cwd).await,
@@ -407,7 +416,7 @@ pub fn observe_runtime(provider: &str, cwd: &Path, data: &Value) -> bool {
     }
     let value = match provider {
         "claude" | "glm" | "mimo" => claude::parse_runtime(data),
-        "opencode" | "antigravity" | "grok" | "commandcode" | "cline" | "kilo" | "github-copilot" | "devin" | "hermes" => acp::parse_runtime(provider, data),
+        "opencode" | "antigravity" | "grok" | "commandcode" | "cline" | "kilo" | "github-copilot" | "devin" | "hermes" | "cursor" => acp::parse_runtime(provider, data),
         "kimi" => kimi::parse_runtime(data),
         _ => None,
     };
@@ -419,6 +428,16 @@ pub fn observe_runtime(provider: &str, cwd: &Path, data: &Value) -> bool {
     } else {
         false
     }
+}
+
+/// Stable FNV-1a over a skill's name and path, so ids never expose paths.
+fn hashed_id(prefix: &str, name: &str, path: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in name.bytes().chain(std::iter::once(0)).chain(path.bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{prefix}:{hash:016x}")
 }
 
 fn normalize(catalog: &mut Catalog, provider: &str) {
@@ -873,6 +892,32 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn deepseek_skills_resolve_as_native_prompts() {
+        let mut catalog = Catalog {
+            commands: vec![SlashCommand {
+                id: "deepseek:skill:1".into(),
+                name: "/ds-tdd".into(),
+                description: "Test-first loop".into(),
+                argument_hint: Some("[instructions]".into()),
+                kind: "prompt".into(),
+                source: "DeepSeek skill · project".into(),
+                reason: None,
+                invocation: Invocation::Native,
+            }],
+            warnings: vec![],
+        };
+        normalize(&mut catalog, "deepseek");
+        assert!(matches!(
+            command(&catalog, "/ds-tdd").invocation,
+            Invocation::Native
+        ));
+        let result = resolve_from_catalog("deepseek", "/ds-tdd fix the bug", &catalog).unwrap();
+        assert_eq!(result.prompt, "/ds-tdd fix the bug");
+        assert!(result.skill.is_none() && result.action.is_none());
+        assert!(result.accepts_attachments && !result.maintenance);
     }
 
     #[test]
@@ -1341,5 +1386,89 @@ mod tests {
             };
             assert!(resolve_from_catalog("codex", "/fixture extra", &value).is_err());
         }
+    }
+
+    // Cursor has no slash-command metadata request: spawning one would open a chat the CLI
+    // cannot delete, so discovery is empty and never reaches the ACP discovery. Runtime
+    // `available_commands_update` frames still feed the shared ACP parser.
+    fn acp_discoveries() -> usize {
+        ACP_DISCOVERIES.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn cursor_command_discovery_is_empty_and_does_not_reach_acp_discovery() {
+        let cwd = Path::new("cursor-commands-never-spawn");
+        let key = catalog_key("cursor", cwd);
+        let before = acp_discoveries();
+        let catalog = discover_catalog("cursor", cwd, key.clone(), Instant::now())
+            .await
+            .expect("no slash commands is not a discovery failure");
+        // `normalize` adds PandaCode's own controls; Cursor contributes nothing.
+        assert!(
+            catalog.commands.iter().all(|command| command.source == "PandaCode"),
+            "{:?}",
+            catalog.commands
+        );
+        assert!(catalog.warnings.is_empty());
+        assert_eq!(
+            acp_discoveries(),
+            before,
+            "Cursor command discovery must not reach acp::discover"
+        );
+        let cached = CACHE
+            .lock()
+            .unwrap()
+            .cached(&key, None)
+            .expect("the empty catalog is committed");
+        assert!(cached.commands.iter().all(|command| command.source == "PandaCode"));
+        assert_eq!(acp_discoveries(), before);
+    }
+
+    const CURSOR_SESSION: &str = include_str!("providers/cursor_frames/session.jsonl");
+
+    fn cursor_commands_frame() -> Value {
+        CURSOR_SESSION
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .map(|entry| entry["frame"].clone())
+            .find(|frame| {
+                frame["params"]["update"]["sessionUpdate"] == "available_commands_update"
+            })
+            .expect("the recording advertises commands")
+    }
+
+    #[test]
+    fn cursor_runtime_commands_use_the_shared_acp_parser() {
+        let frame = cursor_commands_frame();
+        let shared = acp::parse_runtime("cursor", &frame).expect("the shared parser reads the frame");
+        let names: Vec<String> = shared
+            .commands
+            .iter()
+            .map(|command| command.name.clone())
+            .collect();
+        assert_eq!(names, ["/autopilot", "/create-hook"]);
+        let cwd = Path::new("cursor-runtime-project");
+        assert_eq!(
+            observe_runtime("cursor", cwd, &frame),
+            acp::parse_runtime("cursor", &frame).is_some()
+        );
+        let catalog = CACHE
+            .lock()
+            .unwrap()
+            .cached(&catalog_key("cursor", cwd), None)
+            .expect("the frame updates the cached catalog");
+        for name in &names {
+            let command = catalog
+                .commands
+                .iter()
+                .find(|command| command.name == *name)
+                .unwrap_or_else(|| panic!("{name} is missing from the catalog"));
+            assert_eq!(command.id, format!("cursor:{name}"));
+        }
+        assert!(!observe_runtime(
+            "cursor",
+            cwd,
+            &json!({"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk"}}})
+        ));
     }
 }

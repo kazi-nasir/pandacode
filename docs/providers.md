@@ -1,7 +1,7 @@
 # Provider integrations
 
 PandaCode launches each installed CLI directly. Claude, Codex, Kimi, OpenCode,
-Antigravity, Grok Build, Devin CLI, ZCode, and Hermes Agent own their authentication; sign in using their official
+Antigravity, Grok Build, Devin CLI, Cursor CLI, ZCode, and Hermes Agent own their authentication; sign in using their official
 CLI or extension.
 The optional Z.AI Coding Plan and MiMo Token Plan API keys are stored as separate
 entries in PandaCode's secrets store (see [secret storage](#secret-storage)) and injected only into their isolated Claude subprocesses. The app discovers executable paths
@@ -164,9 +164,15 @@ it, and the harness would lose all its API traffic. The harness's own
 credentials and endpoints still win over inherited variables, and mirroring a
 task to another computer stays untouched — that computer uses its own settings.
 
-The per-provider list and the opt-out switch live on each provider's card here,
-so harnesses without a card (Codex and Kimi Code) currently take only the
-global set.
+The per-provider list and the opt-out switch live on each provider's card here.
+Every harness has one: those with sign-in specifics are written by hand, and the
+rest of the roster (Codex and Kimi Code today) gets a generated card with an
+executable location and these environment settings.
+
+A saved executable location must be an absolute path to an existing executable
+file; it is started directly, never through a shell. GLM Coding Plan and MiMo
+Token Plan run the Claude executable, so they have no location of their own and
+use the one on the Claude Code card.
 
 ## GitHub Copilot CLI
 
@@ -281,6 +287,9 @@ them; the adapter does not wait for the turn to finish. Claude launches with
 message, with bounded `data.messageId` and optional `data.phase` (Codex commentary
 or final answer). Native persistence flushes the preceding assistant message at
 this boundary without storing a marker row.
+`note` is PandaCode's own line at a run's end (a subagent's report lost, a background
+command stopped). It saves as a `system` row after the flushed reply: both clients show
+it outside the fold, and it is never the agent's reply, a worker's report or harness context.
 If message IDs interleave, a resumed ID starts a new contiguous display segment;
 text never appends silently to another message's live buffer.
 
@@ -446,13 +455,46 @@ parent run and persists child history separately from the parent's messages.
   [tool notification mapping](https://github.com/MoonshotAI/kimi-code/blob/main/packages/acp-server/src/events-map.ts),
   and [Agent tool parameters](https://github.com/MoonshotAI/kimi-code/blob/main/docs/en/reference/tools.md).
 
-Each run retains at most 64 child previews at a time. When that cache fills,
-its oldest terminal child retires to make room for later delegates; active children
-are never evicted (up to 64 simultaneous children). Each retained child keeps a 32 KiB response preview and its latest 16 tools (2 KiB input / 4 KiB output
-per tool); prompt previews are 4 KiB. Consumed child frames move into the parser
-instead of copying potentially multi-megabyte envelopes. Rendering receives only
-bounded snapshots, and storage checkpoints ongoing updates at most once per
-second. Parent exit/stop and app recovery settle children still marked active.
+A run tracks every child; there is no cap on children, and nothing is evicted. Codex
+has its own limit per session (`agents.max_concurrent_threads_per_session`; past it,
+spawns fail with `AgentLimitReached`), so PandaCode launches it with
+`-c agents.max_threads=1024` (the older name, which every version reads; 0.144 and older
+refuse to start on the new one) unless the `config.toml` in your Codex home or in `<task folder>/.codex/` sets either name
+(other layers Codex reads, such as a parent folder's `.codex/` or a system config, are not checked); then your value stands, and subagents past it are refused by Codex. Each
+child's preview keeps its latest 256 KiB of response and 64 tools (4 KiB input / 8 KiB
+output per tool). The harness's own result to the parent is not affected by these
+bounds. Consumed child frames move into the parser instead of copying potentially
+multi-megabyte envelopes. Snapshots reach the window at most every 250 ms per child, a
+status change at once, and storage checkpoints ongoing updates at most once per second.
+Parent exit/stop and app recovery settle children still marked active.
+
+Saved history keeps every child. `list_subagents` returns light rows (no tools, about
+1 KiB of prompt and response, and `toolCount`), so opening a thread stays cheap whatever
+its children weigh; `get_subagent` returns one full snapshot when a row is opened. Live
+events carry full data, and a list row never replaces it. `pandacode_list_subagents`
+pages by `offset` and `nextOffset`.
+
+Claude Code keeps the run open for its background agents: while any runs, with no time
+limit (known from `background_tasks_changed`, or `task_started` with `is_backgrounded`
+on a CLI that sends no list; a terminal `task_notification` or `task_updated` settles
+one even if no list follows). An inner agent that settles while its parent subagent is open,
+foreground or background, reports to that subagent and is owed nothing; one that outlives its
+parent gets its own hand-back turn. After the parent's `result`, the run waits for what is
+still owed: 10 s for a settled agent's hand-back (120 s over the cloud bridge, whose
+polling backs off in a network blip), the same after an empty notification `result` (no turns,
+no text: Claude merged it with another notification and the turn answering both follows, recorded
+2 s later; if none comes the run ends cleanly) and 15 minutes for a prompt or steer Claude has not
+taken, because hooks run before that turn's first frame. `--include-hook-events` (passed
+when the CLI's `--help` lists it, never over the cloud bridge) shows a UserPromptSubmit hook
+starting, and the same 15 minutes apply while it runs. A background command a subagent owns
+(`parent_task_id`) holds the run too, for up to 5 minutes from when it first does (a steer never restarts them, and the thread's status line says what it is waiting on), because the subagent is woken
+when it ends and reports then; when it ends the short wait starts over, and the parent's own
+background commands never hold. At the 5 minutes the main agent gets one plain-text turn on
+stream input, naming the subagent and command and saying the report will not arrive; that
+turn's `result` ends the run and the transcript notes the command was stopped, so a dev server
+can never hold a run twice. If no turn starts within 120 s the run ends with the same note.
+Stop works throughout. A
+child's `task_progress` counts as activity for the team watchdog's silence limit.
 
 Deterministic protocol tests cover interleaved child identities, nested linkage,
 permission waiting/resumption, final-suffix recovery and replay deduplication,
@@ -499,15 +541,23 @@ written into argv or a settings file; it is resolved from PandaCode's secrets st
 subprocess credential scrubbing is enabled.
 
 Antigravity launches Google's official `agy_acp_server.par` (`agy_acp_server.exe`
-on Windows), which can be selected in Settings. The standalone `agy` terminal
-CLI is not misidentified as an ACP server. The executable and provider sign-in
-must already be installed. ACP initialization/session metadata supplies its model
+on Windows), which can be selected in Settings. When that server is not found,
+PandaCode falls back to the standalone `agy` CLI and starts its ACP server with
+`agy acp`; an executable override named `agy` starts the same way. The executable
+and provider sign-in must already be installed. ACP initialization/session metadata supplies its model
 labels and supported controls; image, HTTP MCP, resume, and planning support are
 checked explicitly. No private API, unofficial adapter, or browser-cookie
 authentication is used. Antigravity's own policy applies, with ACP approval
 requests shown in Standard; Auto edits approves explicit edit requests and Full
 access approves offered one-time permissions. Structured questions are not
-auto-selected. Modes not advertised by the server are not invented.
+auto-selected. Modes not advertised by the server are not invented: when the
+server advertises no Plan counterpart, a Plan task still runs in the server's
+current mode, with PandaCode prefixing the read-only brief, declining
+state-changing permission requests and naming that mode in the status line;
+Accept edits and Full access fall back the same way with the same note. A
+fallback is refused when the server's current mode looks more permissive than
+the chosen one (an edit or bypass mode for Plan or Standard, a bypass mode for
+Accept edits).
 
 **Connection check.** In Settings, expand Antigravity's installation details and
 choose **Check connection**. This separately verifies ACP initialization and an
@@ -715,13 +765,31 @@ session only after it has received a prompt. It has no `session/resume`.
 **Not available from Cline's ACP server (3.0.73).** Images: `image: true` is
 advertised, but the prompt keeps only text blocks, so screenshots are sent as
 file paths that its `read_files` tool opens. Cline ignores the ACP `mcpServers`
-list and does not advertise HTTP MCP, so PandaCode tools (titles, run/preview,
-team tools) are unavailable, and a task that requires them fails at startup.
+list and does not advertise HTTP MCP, so PandaCode tools reach it another way (below).
 There are also no `available_commands_update` (slash commands), no `usage_update`
 (context meter) and no usage limits. Mid-turn messages stay queued.
 
+**PandaCode tools.** For a run that has PandaCode tools (titles, run/preview, team
+tools), PandaCode writes a per-run settings file and points `CLINE_MCP_SETTINGS_PATH`
+at it. The file holds your Cline MCP servers (read from where Cline looks, unchanged;
+a file that can't be parsed counts as empty, and those servers are then missing for
+that run) with PandaCode's own server over them, as direct HTTP to its loopback host
+(`http://127.0.0.1:<port>/mcp`). No package is downloaded. Your own settings file is
+never written, and anything Cline saves to its MCP settings during the run is
+discarded with the copy. The run's bearer token is only in that file: mode 0600, in
+a private `cline-mcp/<uuid>/` folder under PandaCode's app data, never in arguments
+or environment values. The folder is removed at run end; one a crash leaves behind
+is swept at a later startup once it is a day old, and its token died with the run.
+Cloud runs can't reach the loopback host, so they keep the startup error when they
+require the tools. Tools limited to the task's own state (titles, change tracking,
+team and schedule tools) skip Cline's permission prompt, as they do on Claude; others
+keep the normal approval. `CLINE_MCP_SETTINGS_PATH` is undocumented Cline behaviour:
+a Cline that stops reading it would run without PandaCode tools rather than fail at
+startup. To check it: `cargo test --lib live_cline_calls_pandacode_tools -- --ignored`
+(sends one short prompt on a free model).
+
 Verified against `cline` 3.0.73 on 2026-10-22 by driving `cline --acp`
-directly. The recorded frames back the unit tests in `providers/cline.rs`, and
+directly, and the tools route against 3.0.74 on 2026-11-04. The recorded frames back the unit tests in `providers/cline.rs`, and
 an ignored smoke test (`live_cline_lists_models`) reads the real catalog without
 spending tokens.
 
@@ -810,6 +878,98 @@ command, a Plan turn and a live steer). The recorded frames back the unit tests 
 (`installed_devin_lists_models_with_efforts`) reads the real catalog and command list
 without sending a prompt.
 
+## Cursor CLI
+
+Cursor's Agent CLI (`agent`, with the backward-compatible alias `cursor-agent`) serves
+ACP v1 with `agent acp`, so PandaCode drives it with the shared ACP adapter
+(`providers/cursor.rs` holds its quirks). You install it yourself; PandaCode does not
+install, update, sign in to or sign out of it, and checks no Cursor release feed. It is
+never the editor command `cursor`. Official docs: [CLI](https://cursor.com/docs/cli) and
+[ACP](https://cursor.com/docs/cli/acp).
+
+**Finding it.** A candidate is the PATH command `agent`, then `cursor-agent`, a Settings
+executable override, or a named connection's binary. Each is used only after an ACP
+`initialize` handshake identifies Cursor (the `cursor_login` auth method); a path is
+never trusted for its name, and a file whose name is `cursor` is always rejected. The
+first accepted path is remembered, and model lists and task runs spawn exactly that
+path instead of looking up `agent` again. The check runs in the background, so the
+provider list never waits for it; a run, a model list, a remote or machine start and
+the terminal console wait for it, and re-check once when Cursor was not found, so a CLI
+installed after launch is picked up without a restart. The 6-hour agent-update timer does
+not start Cursor. On Windows the official installer's `agent.cmd` is found on PATH and
+launched as the newest installed version's `node.exe index.js`, never through
+`cmd.exe` or PowerShell; a named connection that points at that same shim is started the
+same way, never as the `.cmd` itself.
+
+**Sign-in.** The CLI keeps its own sign-in: run `agent login`, or set `CURSOR_API_KEY` /
+`CURSOR_AUTH_TOKEN` (the provider environment variables apply). PandaCode adds no login,
+device flow or key card. A task sends ACP `authenticate` with `cursor_login` and waits at
+most 60 seconds; an error or silence stops the run with a message to sign in, never a
+browser wait (`NO_OPEN_BROWSER=1` is set so the CLI prints its login URL instead of
+opening one, and PandaCode does not show it). A CLI that exits while that call is pending
+also reads as signed out, except when it refused the chosen model (“Cannot use this
+model”), which says so. Signing in is not part of installed: an unsigned Cursor stays
+selectable and shows the sign-in message.
+
+**Models.** The picker runs `agent models` on the accepted path (60-second bound, cached
+for five minutes, no ACP session) and lists whatever the account prints; there is no
+built-in catalog and no effort control, because efforts are separate model ids. A signed-out
+list shows the sign-in message; other failures say PandaCode could not read the list and to
+run `agent models` in a terminal. A task passes `--model <id>` before `acp` (not for
+`default`). If the session does not report the chosen model, a status line says so
+instead of silently using another.
+
+**Modes.** Standard, Accept edits and Full access are Cursor's Agent mode (full tools);
+PandaCode never selects Cursor's read-only Ask mode, never passes `--mode=ask`, `--force`,
+`--yolo`, `--auto-review`, `--approve-mcps` or `--trust`, and an unexpected mode id never
+fails a turn. A resumed chat left in Plan or Ask is switched to the advertised Agent mode
+when there is one. Cursor applies file edits without asking in Agent mode, so Accept edits
+matches Standard for those; a single once-allow permission on an edit is approved in
+Accept edits and Full access, and everything else shows the approval card. Approving
+always chooses `allow_once` and denying `reject_once`; the always options are never
+chosen. Plan passes `--mode=plan` before `acp` on every Plan spawn, including a resume,
+and sends one `session/set_mode` (client id 4) when the session advertises a Plan mode
+that is not already current. When no Plan mode is advertised the turn still runs, with a
+status line that Plan was unavailable and the session possibly staying in Agent. Review is
+not offered.
+
+**Plans, questions and todos.** `cursor/create_plan` shows PandaCode's approval card with
+the plan and todos. In Plan the card asks “Accept this plan?” and accepting does not
+implement it: switch the task to Standard, Accept edits or Full access. Elsewhere it asks
+“Implement this plan?”. `cursor/update_todos` fills the todo list. `cursor/ask_question`
+uses the question card (up to 3 questions with up to 20 options each; anything else is
+answered with an error and a status line). `cursor/task` and `cursor/generate_image` get
+an empty success result and no new panel.
+
+**Session.** The first turn creates a session and its id is the task's resume id. Later
+turns use `session/load`, and an id the CLI cannot load fails the turn instead of starting
+a new conversation. Cursor starts cold (no warm start). PandaCode's tools are offered
+over HTTP MCP only when the CLI advertises it; otherwise the run continues without them,
+and no `.cursor/mcp.json` or `cli-config.json` is written. Team workers can use Cursor.
+
+**Commands.** Slash-command discovery does not start a process (it would create a chat),
+but a command list the task session sends is shown in the composer.
+
+**Terminal console.** The console opens only before a task's first turn, with
+`--mode=plan` in Plan and no mode flag otherwise. After the task has run, its ACP session
+is not a chat the console can resume, so the console is refused with that explanation.
+
+**Remote and usage.** A viewer starting Cursor on another computer leaves the
+installed check to that computer. The CLI exposes no usage API, so the usage panel says
+it is not available. No telemetry opt-out is known; Settings → Privacy lists Cursor as
+unknown.
+
+Verified against Cursor Agent CLI `2026.09.15-d2fe57e` on 2026-11-02 and 2026-11-03 by
+driving `agent acp` directly on Windows (initialize, signed-in and signed-out
+`authenticate`, `session/new` and `session/load` with and without `--model`, a prompt
+with an edit, a permission request, cancel, a failed load, Plan and plan accept and
+reject, `cursor/update_todos`, and `agent models` signed in and out). The scrubbed frames
+and a Recorded/Unrecorded list are in `providers/cursor_frames/NOTES.md`; they back the
+unit tests in `providers/cursor.rs`. `cursor/ask_question`, `cursor/task` and
+`cursor/generate_image` were never raised and are covered by tests built from Cursor's
+published schema. An ignored smoke test (`installed_cursor`) reads the real model list
+and creates no chat.
+
 ## ZCode
 
 ZCode (z.ai's coding CLI, installed to `~/.local/bin/zcode` by its install script;
@@ -860,6 +1020,25 @@ Verified against the CLI bundled with ZCode.app (user-agent `ZCode/3.16.3`) on
 a permission round-trip, mode/thought switches, usage and resume). The recorded
 frames back the unit tests in `providers/zcode.rs`, and an ignored smoke test
 (`installed_zcode_lists_models`) reads the real catalog without sending a prompt.
+
+Re-verified without a prompt against the CLI bundled with ZCode.app 3.17.2 on
+2026-11-03 (`installed_zcode_snapshot_capabilities`, also ignored): the create
+snapshot now also carries `slashCommands` (name, description, input hint,
+source; builtins include `/goal` and `/compact`), `todos` and a `projection`
+(live context use against the window, pending permissions, active tool calls).
+Catalog entries carry `description`, `maxOutputTokens`, a `disabledReason` and
+`properties.inputFormat` (`supportsText`/`supportsImage`/`supportsVideo`/
+`supportsAudio`/`supportsPdf`); image support is per model (GLM-5.3-Flash
+reports it, GLM-5.3 does not). The entry schema is strict and has no speed or
+service-tier field: the GLM Coding Plan sells speed per plan, never per model, so there is no
+ZCode equivalent of Codex's per-model speed tiers to select. `session/create`
+also accepts `mcpServers` (stdio or http/sse entries), `additionalDirectories`
+and tool allow/deny lists, and `session/usage` answers session token totals
+(input, output, reasoning, cache creation and read, request and error counts);
+a fresh deferred session may answer session-not-found there until its first
+send. Coding Plan quota itself is the desktop app's account state and is not
+exposed on this protocol. Event names during a real turn were not re-recorded
+(no prompt was sent), so streaming frames stay pinned to the 3.16.3 recordings.
 
 ## Hermes Agent
 

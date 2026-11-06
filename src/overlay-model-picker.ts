@@ -12,7 +12,10 @@ function watchModelPreferences(): Promise<unknown> {
   return watching ??= (async () => {
     const invalidate = () => { catalogs.delete('opencode'); discovery = undefined; };
     if (nativeOverlay) {
-      await (await import('@tauri-apps/api/event')).listen<{provider:string}>('provider-models-changed', event => { if (event.payload.provider === 'opencode') invalidate(); });
+      const { listen } = await import('@tauri-apps/api/event');
+      await listen<{provider:string}>('provider-models-changed', event => { if (event.payload.provider === 'opencode') invalidate(); });
+      // A background handshake (Cursor CLI) changed the provider list: list again.
+      await listen<{provider:string}>('providers-changed', () => { discovery = undefined; });
     } else {
       window.addEventListener('storage', event => { if (event.key === 'pandacode.preview.opencode-models') invalidate(); });
       window.addEventListener('pandacode-preview-models-changed', invalidate);
