@@ -65,9 +65,9 @@ mod subagents;
 mod text_stream;
 #[cfg(windows)]
 pub(crate) mod windows_job;
-pub use subagents::SubagentActivity;
+pub use subagents::{SubagentActivity, HEARTBEAT};
 
-const MAX_FRAME: usize = 4 * 1024 * 1024;
+const MAX_FRAME: usize = 64 * 1024 * 1024;
 /// Capacity the frame buffer keeps after a large message has been consumed.
 const FRAME_KEEP: usize = 64 * 1024;
 const MODEL_CATALOG_LIMIT: usize = 10_000;
@@ -610,7 +610,7 @@ pub(crate) fn executable(name: &str) -> Option<PathBuf> {
         return Some(path);
     }
     launch::find(executable_name(name))
-        .or_else(|| if name == "hermes" { launch::find("hermes-acp") } else if name == "devin" { devin::bundled() } else if name == "zcode" { zcode::bundled() } else { None })
+        .or_else(|| if name == "hermes" { launch::find("hermes-acp") } else if name == "devin" { devin::bundled() } else if name == "zcode" { zcode::bundled() } else if name == "antigravity" { launch::find("agy") } else { None })
 }
 
 /// Starts a provider CLI with the provider's saved environment variables applied.
@@ -639,6 +639,10 @@ fn executable_name(name: &str) -> &str {
 /// when PandaCode was opened from Finder or the Dock with a minimal PATH.
 pub(crate) fn tool_path(name: &str) -> Option<std::path::PathBuf> {
     launch::find(name)
+}
+
+pub(crate) fn sweep_cline_mcp_settings(data: &Path) {
+    cline::sweep_mcp_settings(data);
 }
 
 pub(crate) fn opencode_configuration(mode: &str) -> String {
@@ -693,6 +697,55 @@ pub(crate) fn mimo_endpoints() -> &'static [(&'static str, &'static str, &'stati
 fn version(path: &Path) -> Option<String> {
     capture(launch::std_command(path).ok()?, &["--version"], Duration::from_secs(2))
         .map(|text| text.chars().take(150).collect())
+}
+
+/// Whether this Claude CLI takes `--include-hook-events` (absent in 2.1.0, present by 2.1.100):
+/// an unknown flag ends the CLI at launch. Answered once per binary, so an update asks again. A
+/// cloud harness's placeholder program answers no: its machine's CLI is unknown, and a
+/// longer grace covers it there.
+fn claude_lists_hook_events(command: &Command) -> bool {
+    let command = command.as_std();
+    let program = Path::new(command.get_program());
+    let key = std::fs::canonicalize(program).unwrap_or_else(|_| program.to_owned());
+    hook_events_answer(key, || {
+        let mut probe = std::process::Command::new(program);
+        probe.args(command.get_args());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            probe.creation_flags(0x08000000);
+        }
+        capture(probe, &["--help"], Duration::from_secs(2))
+    })
+}
+
+/// The answer for this binary: remembered, else `help` (None when it timed out or failed to spawn).
+fn hook_events_answer(key: PathBuf, help: impl FnOnce() -> Option<String>) -> bool {
+    static KNOWN: std::sync::LazyLock<Mutex<HashMap<PathBuf, bool>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    static PROBING: Mutex<()> = Mutex::new(());
+    let known = |key: &Path| KNOWN.lock().ok().and_then(|known| known.get(key).copied());
+    if let Some(known) = known(&key) {
+        return known;
+    }
+    // The caller is an async run start, so the wait leaves the runtime's thread free. Parallel first
+    // runs take turns and reuse the answer.
+    // ponytail: one lock for every binary; a CLI that never answers delays N parallel starts by 2 s each.
+    crate::blocking_snapshot(|| {
+        let _turn = PROBING.lock();
+        if let Some(known) = known(&key) {
+            return known;
+        }
+        // A timeout says nothing about the CLI, so only an answer is remembered. A CLI that never
+        // answers costs each run's start 2 s; one that fails to spawn fails at once.
+        let Some(help) = help() else {
+            return false;
+        };
+        let listed = help.contains("--include-hook-events");
+        if let Ok(mut known) = KNOWN.lock() {
+            known.insert(key.clone(), listed);
+        }
+        listed
+    })
 }
 
 /// Runs an installed provider's CLI and returns its stdout (up to 2 MiB); None when the
@@ -1166,6 +1219,39 @@ fn parse_claude_models(result: &Value) -> Result<Vec<ModelInfo>, String> {
     Ok(models)
 }
 
+/// Claude's initialize reply carries its commands, agents and models in one
+/// line, which can pass 256 KiB with many skills or plugins (#276).
+const CLAUDE_INIT_FRAME: usize = 4 * 1024 * 1024;
+
+async fn read_claude_models(stdout: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<Vec<ModelInfo>, String> {
+    let mut bytes = Vec::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut total = 0;
+    loop {
+        let count = stdout.read(&mut buffer).await.map_err(|e| format!("Claude model stream failed: {e}"))?;
+        if count == 0 { return Err("Claude exited before returning its model catalog; update the CLI or enter a custom model ID".into()); }
+        total += count;
+        if total > 2 * CLAUDE_INIT_FRAME { return Err("Claude model discovery exceeded its output limit".into()); }
+        // Only the new bytes can hold a newline: rescanning the held partial
+        // frame on every read would be quadratic in a multi-megabyte frame.
+        let scan = bytes.len();
+        bytes.extend_from_slice(&buffer[..count]);
+        let mut consumed = 0;
+        for end in bytes[scan..].iter().enumerate().filter_map(|(i, byte)| (*byte == b'\n').then_some(scan + i)) {
+            let line = &bytes[consumed..end]; consumed = end + 1;
+            if line.len() > CLAUDE_INIT_FRAME { return Err("Claude model catalog frame is too large".into()); }
+            if line.iter().all(u8::is_ascii_whitespace) { continue; }
+            let message: Value = serde_json::from_slice(line).map_err(|_| "Claude returned invalid model discovery JSON")?;
+            if message["type"] != "control_response" || message["response"]["request_id"] != "pandacode-models" { continue; }
+            let response = &message["response"];
+            if response["subtype"] != "success" { return Err("Claude could not load its model catalog; check the CLI or enter a custom model ID".into()); }
+            return parse_claude_models(&response["response"]);
+        }
+        bytes.drain(..consumed);
+        if bytes.len() > CLAUDE_INIT_FRAME { return Err("Claude model catalog frame is too large".into()); }
+    }
+}
+
 async fn claude_models(path: &Path) -> Result<Vec<ModelInfo>, String> {
     let mut command = provider_command("claude", path)?;
     claude_auth::configure(&mut command, "claude");
@@ -1201,29 +1287,7 @@ async fn claude_models(path: &Path) -> Result<Vec<ModelInfo>, String> {
     let mut stdout = child.stdout.take().ok_or("Claude stdout unavailable")?;
     let result = tokio::time::timeout(Duration::from_secs(15), async {
         write_json(&mut stdin, &json!({"type":"control_request","request_id":"pandacode-models","request":{"subtype":"initialize","hooks":null}})).await?;
-        let mut bytes = Vec::new();
-        let mut buffer = [0u8; 4096];
-        let mut total = 0;
-        loop {
-            let count = stdout.read(&mut buffer).await.map_err(|e| format!("Claude model stream failed: {e}"))?;
-            if count == 0 { return Err("Claude exited before returning its model catalog; update the CLI or enter a custom model ID".into()); }
-            total += count;
-            if total > 1024 * 1024 { return Err("Claude model discovery exceeded its output limit".into()); }
-            bytes.extend_from_slice(&buffer[..count]);
-            let mut consumed = 0;
-            for end in bytes.iter().enumerate().filter_map(|(i, byte)| (*byte == b'\n').then_some(i)) {
-                let line = &bytes[consumed..end]; consumed = end + 1;
-                if line.len() > 256 * 1024 { return Err("Claude model catalog frame is too large".into()); }
-                if line.iter().all(u8::is_ascii_whitespace) { continue; }
-                let message: Value = serde_json::from_slice(line).map_err(|_| "Claude returned invalid model discovery JSON")?;
-                if message["type"] != "control_response" || message["response"]["request_id"] != "pandacode-models" { continue; }
-                let response = &message["response"];
-                if response["subtype"] != "success" { return Err("Claude could not load its model catalog; check the CLI or enter a custom model ID".into()); }
-                return parse_claude_models(&response["response"]);
-            }
-            bytes.drain(..consumed);
-            if bytes.len() > 256 * 1024 { return Err("Claude model catalog frame is too large".into()); }
-        }
+        read_claude_models(&mut stdout).await
     }).await.unwrap_or_else(|_| Err("Claude model discovery timed out; check the CLI or enter a custom model ID".into()));
     drop(stdin);
     drop(group);
@@ -1345,6 +1409,11 @@ struct Protocol {
     acp_pending_session: Option<Value>,
     grok_context_used: u64,
     grok_reasoning: bool,
+    /// A plan task whose harness advertises no plan mode: PandaCode keeps it
+    /// read-only itself (prompt prefix, permission declines).
+    plan_fallback: bool,
+    /// Which mode a fallback ran in, shown once the prompt is sent.
+    mode_note: Option<String>,
     claude_input_tokens: Option<u64>,
     claude_output_tokens: u64,
     subagents: Option<subagents::Subagents>,
@@ -1472,6 +1541,8 @@ impl Protocol {
             acp_pending_session: None,
             grok_context_used: 0,
             grok_reasoning: false,
+            plan_fallback: false,
+            mode_note: None,
             claude_input_tokens: None,
             claude_output_tokens: 0,
             subagents: Some(subagents::Subagents::default()),
@@ -1540,7 +1611,7 @@ impl Protocol {
         // not retain a second copy for the rest of a potentially long turn.
         let mut content = std::mem::take(&mut self.image_blocks);
         let mut text = std::mem::take(&mut self.config.prompt);
-        if matches!(self.config.provider.as_str(), "grok" | "deepseek" | "muse" | "hermes") && self.config.mode == "plan" && !text.trim().is_empty() {
+        if (matches!(self.config.provider.as_str(), "grok" | "deepseek" | "muse" | "hermes") || self.plan_fallback) && self.config.mode == "plan" && !text.trim().is_empty() {
             text = format!("{}\n\n{text}", acp::READ_ONLY_PLAN_PREFIX);
         }
         if !text.trim().is_empty() {
@@ -1586,7 +1657,7 @@ impl Protocol {
         AgentEvent {
             session_id: self.config.session_id.clone(),
             kind: kind.into(),
-            text: if kind == "text" || kind == "thinking" || kind == "session" {
+            text: if matches!(kind, "text" | "thinking" | "session" | "note") {
                 text
             } else {
                 short(&text)
@@ -1656,7 +1727,9 @@ impl Protocol {
         self.tools.insert(id, tool.clone());
         // The authenticated bridge emits these calls itself. Provider tool
         // frames are retained for joining sparse results, but not shown twice.
-        if self.mcp_tool_names.contains(&tool.name) {
+        if self.mcp_tool_names.contains(&tool.name)
+            || (self.config.provider == "cline" && cline::host_tool(&tool.name).is_some_and(|name| self.mcp_tool_names.contains(name)))
+        {
             return;
         }
         let mut event = self.event("tool", format!("{} · {}", tool.name, tool.status), None);
@@ -1929,16 +2002,12 @@ impl Protocol {
             }
         }
     }
-    fn approval(&mut self, value: Value, text: String, step: &mut Step) -> Result<(), String> {
-        if self.pending.len() + self.inputs.len() >= 64 {
-            return Err("Too many simultaneous approval requests".into());
-        }
+    fn approval(&mut self, value: Value, text: String, step: &mut Step) {
         let request_id = uuid::Uuid::new_v4().to_string();
         let mut event = self.event("approval", short(&text), Some(&value));
         event.request_id = Some(request_id.clone());
         self.pending.insert(request_id, value);
         step.events.push(event);
-        Ok(())
     }
     fn approve(&mut self, id: &str, approved: bool) -> Option<Value> {
         if self.config.provider == "muse" {
@@ -2014,6 +2083,18 @@ impl Protocol {
         }
         self.subagents = Some(subagents);
         result
+    }
+    /// Sends child snapshots the throttle held back; `all` also sends those not yet due.
+    fn flush_subagents(&mut self, all: bool) -> Step {
+        let mut step = Step::default();
+        if let Some(mut subagents) = self.subagents.take() {
+            step.events = subagents.flush_due(self, all);
+            self.subagents = Some(subagents);
+        }
+        step
+    }
+    fn subagent_flush_at(&self) -> Option<tokio::time::Instant> {
+        self.subagents.as_ref().and_then(subagents::Subagents::next_flush)
     }
     fn receive_inner(&mut self, value: Value) -> Result<Step, String> {
         match self.config.provider.as_str() {
@@ -2188,7 +2269,7 @@ impl Protocol {
             },
             "item/commandExecution/requestApproval"|"item/fileChange/requestApproval"|"item/permissions/requestApproval" => {
                 let label=if params["command"].is_string() { string(params,"command") } else if params["reason"].is_string() {string(params,"reason")} else {"Allow this agent action?".into()};
-                self.approval(value,label,&mut step)?;
+                self.approval(value,label,&mut step);
             },
             "turn/completed" => {
                 self.goal_turn_completed(params, &mut step)?;
@@ -2436,7 +2517,7 @@ impl Protocol {
                     step.write.push(json!({"jsonrpc":"2.0","id":value["id"],"result":{"outcome":{"outcome":"cancelled"}}}));
                     return Ok(step);
                 }
-                let label=string(&params["toolCall"],"title");self.approval(value,if label.is_empty(){"Allow this agent action?".into()}else{label},&mut step)?;
+                let label=string(&params["toolCall"],"title");self.approval(value,if label.is_empty(){"Allow this agent action?".into()}else{label},&mut step);
             },
             _ if value.get("id").is_some() && !method.is_empty()=>step.write.push(json!({"jsonrpc":"2.0","id":value["id"],"error":{"code":-32601,"message":"Client capability not supported"}})),
             _=>{},
@@ -2481,6 +2562,7 @@ impl Protocol {
         {
             return Ok(step);
         }
+        self.claude_turn_activity(&value);
         match string(&value, "type").as_str() {
             "control_response" => {
                 let response = &value["response"];
@@ -2525,6 +2607,18 @@ impl Protocol {
             }
             "system" if value["subtype"] == "commands_changed" => {
                 self.commands_changed(&value, &mut step);
+            }
+            "system" if value["subtype"] == "background_tasks_changed" => {
+                self.claude_background_tasks(&value);
+            }
+            "system" if value["subtype"] == "task_started" => {
+                self.claude_task_started(&value);
+            }
+            "system" if matches!(field(&value, "subtype"), "hook_started" | "hook_response") => {
+                self.claude_hook(&value);
+            }
+            "system" if matches!(field(&value, "subtype"), "task_notification" | "task_updated") => {
+                self.claude_task_ended(&value);
             }
             "system" if value["subtype"] == "local_command_output" => {
                 if let Some(text) = value["content"].as_str().filter(|text| !text.is_empty()) {
@@ -2689,7 +2783,7 @@ impl Protocol {
                 }
             }
             "user" => {
-                if value["isReplay"] == true {
+                if !self.claude_notification_taken(&value) && value["isReplay"] == true {
                     self.claude_replay(&value["message"]["content"], &mut step);
                 }
                 if let Some(content) = value["message"]["content"].as_array() {
@@ -2718,7 +2812,7 @@ impl Protocol {
                     // Questions need structured answers; a boolean allow must not silently submit one.
                     if name == "AskUserQuestion" {
                         step.write.push(json!({"type":"control_response","response":{"subtype":"success","request_id":value["request_id"],"response":{"behavior":"deny","message":"Ask the user in your response; this UI supports free-text replies."}}}));
-                    } else if name.strip_prefix("mcp__pandacode_architect__").is_some_and(|tool| optional_metadata_tool(tool) || crate::bots::tools::self_scoped(tool) || crate::schedules::tools::self_scoped(tool) || crate::architect::team_tool(tool))
+                    } else if name.strip_prefix("mcp__pandacode_architect__").is_some_and(self_scoped_host_tool)
                         && self.mcp_tool_names.contains(&name)
                     {
                         // Registered metadata callbacks only stage this run's
@@ -2737,7 +2831,7 @@ impl Protocol {
                             value,
                             if command.is_empty() { name } else { command },
                             &mut step,
-                        )?;
+                        );
                     }
                 } else {
                     step.write.push(json!({"type":"control_response","response":{"subtype":"error","request_id":value["request_id"],"error":"Control request unsupported"}}));
@@ -2795,9 +2889,9 @@ impl Protocol {
                     let id = self.claude_text_id(&Value::Null);
                     self.text_snapshot(&id, None, text, &mut step);
                 }
-                // A steer Claude has not echoed yet arrived as the turn ended: Claude
-                // starts another turn for it in this process, so keep the run open.
-                step.done = !self.claude_steers_open();
+                // Claude starts another turn in this process for a steer it has not echoed
+                // and for a background agent's hand-back, so the run stays open for those.
+                step.done = self.claude_turn_ended(&value, &mut step);
             }
             _ => {}
         }
@@ -2808,7 +2902,9 @@ impl Protocol {
 async fn write_json(stdin: &mut ChildStdin, value: &Value) -> Result<(), String> {
     let mut bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // A large message over the cloud bridge drains in slow chunks; that is not a stuck harness.
+    let patience = Duration::from_secs(5 + (bytes.len() / (256 * 1024)) as u64);
+    tokio::time::timeout(patience, async {
         stdin.write_all(&bytes).await?;
         stdin.flush().await
     })
@@ -3123,6 +3219,26 @@ pub async fn run_with_tools(
     result
 }
 
+/// Codex refuses subagents past this (`AgentLimitReached`, no row, no report); a task's children have no cap of ours.
+/// The old name on purpose: 0.145+ renamed it to `max_concurrent_threads_per_session` and keep this as a serde alias,
+/// while 0.144 and older read the new name as an agent role and refuse to start.
+const CODEX_NO_THREAD_LIMIT: &str = "agents.max_threads=1024";
+
+/// Whether the user's Codex config (the home this launch uses, or the project's) sets the limit;
+/// `max_threads` is its older name. Their choice stands, and a `-c` would override it.
+fn codex_user_limits_threads(command: &Command, config: &RunConfig) -> bool {
+    let connection = crate::connections::for_task(&config.session_id, "codex");
+    let own = connection.and_then(|connection| connection.config_dir.or_else(|| connection.env.get("CODEX_HOME").cloned())).map(std::ffi::OsString::from);
+    let set = command.as_std().get_envs().find(|(name, _)| *name == "CODEX_HOME").and_then(|(_, value)| value.map(ToOwned::to_owned));
+    let home = own.or(set).or_else(|| std::env::var_os("CODEX_HOME")).map(PathBuf::from)
+        .or_else(|| crate::agent_usage_providers::home().map(|home| home.join(".codex")));
+    home.into_iter().chain([Path::new(&config.cwd).join(".codex")]).any(|dir| {
+        let Some(text) = std::fs::read_to_string(dir.join("config.toml")).ok() else { return false };
+        let Ok(toml) = text.parse::<toml::Table>() else { return false };
+        toml.get("agents").and_then(toml::Value::as_table).is_some_and(|agents| agents.contains_key("max_concurrent_threads_per_session") || agents.contains_key("max_threads"))
+    })
+}
+
 fn configure_command(command: &mut Command, config: &RunConfig) {
     claude_auth::configure(command, &config.provider);
     let use_model = !config.model.is_empty() && config.model != "default";
@@ -3130,6 +3246,9 @@ fn configure_command(command: &mut Command, config: &RunConfig) {
         "codex" => {
             // Process-local override: never alter the user's Codex config.
             command.args(["app-server", "--enable", "goals"]);
+            if !codex_user_limits_threads(command, config) {
+                command.args(["-c", CODEX_NO_THREAD_LIMIT]);
+            }
         }
         "pi" | "omp" => pi::configure(command, config),
         "zcode" => zcode::configure(command),
@@ -3161,6 +3280,10 @@ fn configure_command(command: &mut Command, config: &RunConfig) {
                 // Echo consumed user messages so steering knows when a mid-turn message was taken.
                 "--replay-user-messages",
             ]);
+            // Shows a slow UserPromptSubmit hook as the owed turn starting, not a silent process.
+            if claude_lists_hook_events(command) {
+                command.arg("--include-hook-events");
+            }
             let permission_mode = match config.mode.as_str() {
                 "auto" => "acceptEdits",
                 // Claude Code's auto mode: its safety reviewer approves routine actions.
@@ -3344,6 +3467,10 @@ async fn run_process(
     run_process_with_tools(config, sink, input, command, image_blocks, None).await
 }
 
+/// Host tools that need no permission prompt once registered for the run.
+fn self_scoped_host_tool(name: &str) -> bool {
+    optional_metadata_tool(name) || crate::bots::tools::self_scoped(name) || crate::schedules::tools::self_scoped(name) || crate::architect::team_tool(name)
+}
 fn optional_metadata_tool(name: &str) -> bool {
     name == crate::session_titles::TOOL || name == crate::turn_changes::TRACK_TOOL
 }
@@ -3471,6 +3598,16 @@ async fn run_process_with_tools(
     let _pi_bridge = if matches!(config.provider.as_str(), "pi" | "omp") {
         Some(pi::Bridge::configure(&mut command, &config.mode, mcp.as_ref())?)
     } else { None };
+    let cline_settings = match &mcp {
+        Some(server) if config.provider == "cline" && !crate::cloud_agents::transport::is_cloud(&config.session_id) => {
+            match cline::mcp_settings(&mut command, &server.kimi_config()) {
+                Ok(folder) => Some(folder),
+                Err(error) if server.required() => return Err(error),
+                Err(_) => None,
+            }
+        }
+        _ => None,
+    };
     reached_harness();
     let lingers = config.provider == "antigravity" && !crate::cloud_agents::transport::is_cloud(&config.session_id);
     let mut agent_temp = None;
@@ -3505,9 +3642,13 @@ async fn run_process_with_tools(
     let stderr = child.stderr.take().ok_or("Provider stderr unavailable")?;
     let mut stderr_task = StderrReader(tokio::spawn(read_stderr(stderr)));
     let mut protocol = Protocol::new(config);
+    if crate::cloud_agents::transport::is_cloud(&protocol.config.session_id) {
+        protocol.claude_over_cloud();
+    }
     protocol.image_blocks = image_blocks;
     protocol.host = host;
-    protocol.mcp_server = mcp.as_ref().map(mcp_host::Server::kimi_config);
+    // Cline already has the server from its settings file, not from `session/new`.
+    protocol.mcp_server = mcp.as_ref().filter(|_| cline_settings.is_none()).map(mcp_host::Server::kimi_config);
     protocol.mcp_required = mcp.as_ref().is_some_and(mcp_host::Server::required);
     protocol.codex_mcp_servers = mcp
         .as_ref()
@@ -3584,6 +3725,14 @@ async fn run_process_with_tools(
                     let step=protocol.expire_approvals(tokio::time::Instant::now());
                     apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await?;
                 },
+                _=tokio::time::sleep_until(protocol.claude_grace().unwrap_or_else(||tokio::time::Instant::now()+Duration::from_secs(86400))),if !stopped && protocol.claude_grace().is_some()=>{
+                    let step=protocol.claude_wait_over();
+                    if apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await? {return Ok(());}
+                },
+                _=tokio::time::sleep_until(protocol.subagent_flush_at().unwrap_or_else(||tokio::time::Instant::now()+Duration::from_secs(86400))),if !stopped && protocol.subagent_flush_at().is_some()=>{
+                    let step=protocol.flush_subagents(false);
+                    apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await?;
+                },
                 _=tokio::time::sleep_until(protocol.goals.deadline().unwrap_or_else(||tokio::time::Instant::now()+Duration::from_secs(86400))),if protocol.goals.deadline().is_some()=>{
                     let step=protocol.goal_tick();
                     if apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await? {return Ok(());}
@@ -3593,6 +3742,12 @@ async fn run_process_with_tools(
                     if count==0 {
                         if stopped{break Ok(());}
                         if auth.armed() {auth_exited=true;break Err(cursor::SIGN_IN_ERROR.into());}
+                        // Exited after a finished turn, while the run was only waiting for another.
+                        if protocol.claude_idle() {
+                            let step=protocol.claude_end_idle();
+                            apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await?;
+                            break Ok(());
+                        }
                         break Err("Agent exited before completing its response".into());
                     }
                     // Retained bytes contain no newline: only scan this read.
@@ -3637,6 +3792,15 @@ async fn run_process_with_tools(
     jobs.abort_all();
     queued.clear();
     protocol.goals.cancel_pending();
+    // Before the run settles its children, so the last text a throttle held back is the one saved.
+    for event in protocol.flush_subagents(true).events {
+        sink(event);
+    }
+    if result.is_ok() && !stopped {
+        for event in protocol.lost_reports_note() {
+            sink(event);
+        }
+    }
     for event in protocol.steers_ended(result.is_ok() && !stopped) {
         sink(event);
     }
@@ -4350,6 +4514,32 @@ mod tests {
     }
 
     #[test]
+    fn codex_launches_without_its_thread_limit_unless_the_user_set_one() {
+        let dir = std::env::temp_dir().join(format!("pandacode-codex-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("home")).unwrap();
+        std::fs::create_dir_all(dir.join("project/.codex")).unwrap();
+        let args = |toml: &str, project: &str| {
+            std::fs::write(dir.join("home/config.toml"), toml).unwrap();
+            std::fs::write(dir.join("project/.codex/config.toml"), project).unwrap();
+            let mut cfg = config("codex");
+            cfg.cwd = dir.join("project");
+            let mut command = Command::new("codex");
+            command.env("CODEX_HOME", dir.join("home"));
+            configure_command(&mut command, &cfg);
+            command.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>()
+        };
+        let plain = ["app-server", "--enable", "goals"];
+        // Checked by starting `codex app-server` with it on 0.141.0 to 0.162.1: the newer name stops 0.144.1 and older.
+        let lifted = [&plain[..], &["-c", "agents.max_threads=1024"]].concat();
+        assert_eq!(args("model = \"x\"\n[agents]\nmax_depth = 2\n", ""), lifted);
+        assert_eq!(args("not toml [", ""), lifted, "Codex reports a broken config itself");
+        assert_eq!(args("[agents]\nmax_concurrent_threads_per_session = 3\n", ""), plain);
+        assert_eq!(args("[agents]\nmax_threads = 3\n", ""), plain, "its older name");
+        assert_eq!(args("", "[agents]\nmax_threads = 3\n"), plain, "a project's config");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn claude_effort_is_passed_to_cli_and_unsupported_model_rejected_before_prompt() {
         for resume in [false, true] {
             let mut cfg = config("claude");
@@ -5002,6 +5192,21 @@ mod tests {
         assert_eq!(models[4].name, "Model Name 3.2");
         assert!(parse_claude_models(&json!({})).is_err());
         assert!(parse_claude_models(&json!({"models":vec![json!({});101]})).is_err());
+    }
+
+    #[tokio::test]
+    async fn claude_catalog_reads_an_initialize_frame_over_256_kib() {
+        // #276: many skills and plugins push Claude's one-line initialize reply
+        // past the old 256 KiB frame limit.
+        let commands: Vec<Value> = (0..3000).map(|i| json!({"name":format!("skill-{i}"),"description":"d".repeat(100)})).collect();
+        let init = json!({"type":"control_response","response":{"request_id":"pandacode-models","subtype":"success","response":{"commands":commands,"models":[{"value":"sonnet","resolvedModel":"claude-sonnet-5","displayName":"Sonnet"}]}}});
+        let output = format!("{{\"type\":\"system\"}}\n{init}\n");
+        assert!(output.len() > 256 * 1024);
+        let models = read_claude_models(&mut output.as_bytes()).await.unwrap();
+        assert_eq!(models[1].id, "sonnet");
+        // Memory stays bounded: an endless frame is refused at the limit.
+        let endless = vec![b'x'; CLAUDE_INIT_FRAME + 1];
+        assert!(read_claude_models(&mut endless.as_slice()).await.unwrap_err().contains("too large"));
     }
 
     #[test]

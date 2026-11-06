@@ -571,8 +571,8 @@ impl Store {
             )
             .map_err(|e| e.to_string())?;
         recovery.execute_batch("UPDATE architect_teams SET content=json_set(content,'$.status','interrupted','$.pendingTurn',NULL,'$.error','PandaCode restarted. Resume explicitly to continue.','$.generation',COALESCE(json_extract(content,'$.generation'),0)+1,'$.revision',COALESCE(json_extract(content,'$.revision'),0)+1,
-            '$.workers',json((SELECT json_group_array(json(CASE WHEN json_extract(value,'$.status') IN ('running','waiting') THEN json_set(value,'$.status','stopped') ELSE value END)) FROM json_each(content,'$.workers'))))
-            WHERE json_extract(content,'$.status') IN ('running','waiting');").map_err(|e|e.to_string())?;
+            '$.workers',json((SELECT json_group_array(json(CASE WHEN json_extract(value,'$.status') IN ('running','waiting') THEN json_set(value,'$.status','stopped') ELSE value END)) FROM json_each(content,'$.workers') WHERE type='object')))
+            WHERE CASE WHEN json_valid(content) THEN json_extract(content,'$.status') END IN ('running','waiting');").map_err(|e|e.to_string())?;
         recovery.commit().map_err(|e| e.to_string())?;
         let ranked: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE sidebar_order IS NOT NULL)", [], |r| r.get(0)).map_err(|e| e.to_string())?;
         if ranked { rank_published_drafts(&db)?; }
@@ -587,13 +587,13 @@ impl Store {
     /// Older team releases stored scheduler prompts as user rows. Reuse their exact
     /// provenance check once during migration, rather than reading transcripts on every list.
     fn record_legacy_prompt_cutoff(db: &Connection) -> Result<()> {
-        db.execute_batch("UPDATE architect_teams SET content=json_set(content,'$.legacyPromptThroughId',COALESCE((SELECT MAX(id) FROM messages WHERE session_id=architect_teams.session_id),0)) WHERE json_type(content,'$.legacyPromptThroughId') IS NULL OR json_type(content,'$.legacyPromptThroughId')='null';").map_err(|e|e.to_string())?;
+        db.execute_batch("UPDATE architect_teams SET content=json_set(content,'$.legacyPromptThroughId',COALESCE((SELECT MAX(id) FROM messages WHERE session_id=architect_teams.session_id),0)) WHERE json_valid(content) AND COALESCE(CASE WHEN json_valid(content) THEN json_type(content,'$.legacyPromptThroughId') END,'null')='null';").map_err(|e|e.to_string())?;
         Ok(())
     }
 
     fn backfill_legacy_prompt_activity(db: &Connection) -> Result<()> {
         Self::record_legacy_prompt_cutoff(db)?;
-        let mut teams = db.prepare("SELECT session_id FROM architect_teams WHERE COALESCE(json_extract(content,'$.legacyPromptThroughId'),0)>0").map_err(|e| e.to_string())?;
+        let mut teams = db.prepare("SELECT session_id FROM architect_teams WHERE COALESCE(CASE WHEN json_valid(content) THEN json_extract(content,'$.legacyPromptThroughId') END,0)>0").map_err(|e| e.to_string())?;
         let ids = teams.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
         let mut messages = db.prepare("SELECT id,content,created_at FROM messages WHERE session_id=?1 AND role='user' AND trim(content)<>'' ORDER BY created_at DESC,id DESC").map_err(|e| e.to_string())?;
         for sid in ids {
@@ -716,6 +716,67 @@ impl Store {
             .optional()
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "Project not found.".into())
+    }
+    /// Point a project at its folder's new location after the folder was renamed or
+    /// moved outside PandaCode. Chats, tasks and history keep their ids.
+    pub fn relink_project(&self, project_id: &str, path: &Path) -> Result<Project> {
+        let project = self.project(project_id)?;
+        if !path.is_absolute() {
+            return Err("Choose an absolute folder path.".into());
+        }
+        let path = path
+            .canonicalize()
+            .map_err(|e| format!("Cannot open folder: {e}"))?;
+        if !path.is_dir() {
+            return Err("Choose a folder.".into());
+        }
+        // Chat folders are PandaCode-managed: never relink one, nor point a project into the chats root.
+        let chats = crate::chats::root();
+        let chats = chats.canonicalize().unwrap_or(chats);
+        if crate::chats::is_chat_folder(Path::new(&project.path)) || path.starts_with(&chats) {
+            return Err("Chat folders cannot be relinked.".into());
+        }
+        let path_str = path.to_string_lossy().to_string();
+        if path_str == project.path {
+            return Ok(project);
+        }
+        let taken: bool = self
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE path=?1 AND id<>?2)",
+                params![path_str, project_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if taken {
+            return Err("Another project already uses this folder.".into());
+        }
+        // The project's name follows its folder's, as it did when the folder was added.
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| project.name.clone());
+        self.db
+            .execute(
+                "UPDATE projects SET name=?2,path=?3 WHERE id=?1",
+                params![project_id, name, path_str],
+            )
+            .map_err(|e| e.to_string())?;
+        self.project(project_id)
+    }
+    /// Worktree checkouts of a project's local tasks (they live beside the project folder,
+    /// so a rename of the project leaves them in place but breaks their Git links).
+    pub fn project_worktrees(&self, project_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT DISTINCT worktree_path FROM sessions WHERE project_id=?1 AND worktree_path IS NOT NULL AND remote_device IS NULL")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([project_id], |r| r.get(0))
+            .map_err(|e| e.to_string())?
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .map_err(|e| e.to_string());
+        rows
     }
     pub fn remove_project(&self, project_id: &str) -> Result<()> {
         self.db
@@ -1127,6 +1188,13 @@ impl Store {
         Ok(())
     }
 
+    /// A cloud run re-attached after a restart: running again, so a Stop saved before the
+    /// quit no longer counts.
+    pub fn reattach_turn(&self, sid: &str) -> Result<()> {
+        self.db.execute("UPDATE sessions SET status='running',task_stage='in_progress',completed_at=NULL,stop_requested=0 WHERE id=?1", [sid]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn begin_goal_operation(&self, sid: &str) -> Result<()> {
         let task = self.session(sid)?;
         if task.archived || task.task_stage == "completed" {
@@ -1210,8 +1278,8 @@ impl Store {
         if title.trim().is_empty() || title.len() > 200 {
             return Err("Title must be 1–200 characters.".into());
         }
-        if description.len() > 128 * 1024 {
-            return Err("Task details must be under 128 KiB.".into());
+        if description.len() > crate::MESSAGE_LIMIT {
+            return Err("Task details must be under 16 MiB.".into());
         }
         Ok(())
     }
@@ -1585,8 +1653,8 @@ impl Store {
         kind: Option<crate::architect::internal_turns::CoordinationKind>,
         reported: &[String],
     ) -> Result<i64> {
-        if content.trim().is_empty() || content.len() > 128 * 1024 {
-            return Err("Write a message under 128 KiB first.".into());
+        if content.trim().is_empty() || content.len() > crate::MESSAGE_LIMIT {
+            return Err("Write a message under 16 MiB first.".into());
         }
         let transaction = self.db.unchecked_transaction().map_err(|e| e.to_string())?;
         let session = self.session(sid)?;
@@ -1621,7 +1689,9 @@ impl Store {
             self.start_turn_message(sid, content)?
         };
         for child in reported {
-            self.db.execute("UPDATE machine_threads SET reported=1,reported_by=?3 WHERE session_id=?1 AND parent_session_id=?2", params![child, sid, message_id]).map_err(|e| e.to_string())?;
+            // A thread still running (its computer went offline) stays unreported: the wake told
+            // of it once (`reported_by`), and its end reports as usual.
+            self.db.execute("UPDATE machine_threads SET reported_by=?3,reported=NOT EXISTS(SELECT 1 FROM sessions WHERE id=?1 AND status IN ('running','waiting')) WHERE session_id=?1 AND parent_session_id=?2", params![child, sid, message_id]).map_err(|e| e.to_string())?;
         }
         transaction.commit().map_err(|e| e.to_string())?;
         Ok(message_id)
@@ -1708,24 +1778,12 @@ impl Store {
         activity: &crate::providers::SubagentActivity,
     ) -> Result<()> {
         let content = serde_json::to_string(activity).map_err(|error| error.to_string())?;
-        if activity.id.is_empty() || activity.id.len() > 1024 || content.len() > 1024 * 1024 {
-            return Err("Subagent activity exceeded its storage limit.".into());
+        if activity.id.is_empty() || activity.id.len() > 1024 {
+            return Err("Subagent activity has an invalid ID.".into());
         }
         self.db.execute("INSERT INTO subagents(session_id,id,content,updated_at) VALUES (?1,?2,?3,?4)
             ON CONFLICT(session_id,id) DO UPDATE SET content=excluded.content,updated_at=excluded.updated_at",
             params![sid,activity.id,content,activity.updated_at]).map_err(|error| error.to_string())?;
-        // Keep current work regardless of age; older terminal snapshots give
-        // way to the newest 64 entries without growing every parent turn.
-        self.db
-            .execute(
-                "DELETE FROM subagents WHERE session_id=?1
-            AND json_extract(content,'$.status') NOT IN ('running','waiting')
-            AND id NOT IN (SELECT id FROM subagents WHERE session_id=?1
-                ORDER BY (json_extract(content,'$.status') IN ('running','waiting')) DESC,
-                updated_at DESC,id DESC LIMIT 64)",
-                [sid],
-            )
-            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -1735,7 +1793,7 @@ impl Store {
             .db
             .prepare(
                 "SELECT content FROM subagents WHERE session_id=?1
-            ORDER BY updated_at DESC,id DESC LIMIT 64",
+            ORDER BY updated_at DESC,id DESC",
             )
             .map_err(|error| error.to_string())?;
         let rows = query
@@ -1746,6 +1804,50 @@ impl Store {
             serde_json::from_str(&content).map_err(|error| error.to_string())
         })
         .collect()
+    }
+
+    /// The list of a task's children without their tools and with short previews. SQLite still
+    /// parses each snapshot, but only this much of it crosses into Rust and on to the webview.
+    // ponytail: the parse is linear in saved bytes; give `subagents` plain columns if a task's
+    // history ever makes opening its thread slow.
+    pub fn subagent_rows(&self, sid: &str) -> Result<Vec<crate::subagent_state::SubagentRow>> {
+        self.session(sid)?;
+        let mut query = self
+            .db
+            .prepare(
+                "SELECT id,json_extract(content,'$.parentId'),json_extract(content,'$.name'),
+                    substr(json_extract(content,'$.prompt'),1,?2),json_extract(content,'$.status'),
+                    substr(json_extract(content,'$.response'),1,?2),json_array_length(content,'$.tools'),
+                    json_extract(content,'$.startedAt'),json_extract(content,'$.updatedAt')
+                 FROM subagents WHERE session_id=?1 ORDER BY updated_at DESC,id DESC",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = query
+            .query_map(params![sid, crate::subagent_state::PREVIEW_CHARS], |row| {
+                Ok(crate::subagent_state::SubagentRow {
+                    id: row.get(0)?,
+                    parent_id: row.get(1)?,
+                    name: row.get(2)?,
+                    prompt: row.get(3)?,
+                    status: row.get(4)?,
+                    response: row.get(5)?,
+                    tool_count: row.get(6)?,
+                    started_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| row.map_err(|error| error.to_string())).collect()
+    }
+
+    /// One saved child in full.
+    pub fn subagent(&self, sid: &str, id: &str) -> Result<Option<crate::providers::SubagentActivity>> {
+        let content: Option<String> = self
+            .db
+            .query_row("SELECT content FROM subagents WHERE session_id=?1 AND id=?2", [sid, id], |row| row.get(0))
+            .optional()
+            .map_err(|error| error.to_string())?;
+        content.map(|content| serde_json::from_str(&content).map_err(|error| error.to_string())).transpose()
     }
 
     pub fn finish_subagents(&self, sid: &str, status: &str) -> Result<()> {
@@ -1992,6 +2094,56 @@ mod tests {
     }
 
     #[test]
+    fn relinking_points_the_project_at_its_moved_folder() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let root = std::env::temp_dir().join(format!("pandacode-relink-{}", id()));
+        std::fs::create_dir_all(root.join("before")).unwrap();
+        std::fs::create_dir_all(root.join("after")).unwrap();
+        let project = store.add_project(&root.join("before")).unwrap();
+        let moved = store.relink_project(&project.id, &root.join("after")).unwrap();
+        assert_eq!(moved.path, root.join("after").canonicalize().unwrap().to_string_lossy().to_string());
+        // The project's label follows the folder's new name.
+        assert_eq!(moved.name, "after");
+        assert_eq!(store.project(&project.id).unwrap().path, moved.path);
+        assert!(store.project_worktrees(&project.id).unwrap().is_empty());
+        // Picking the folder the project already points at changes nothing.
+        assert_eq!(store.relink_project(&project.id, &root.join("after")).unwrap().id, project.id);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn relinking_refuses_missing_taken_file_and_chat_folders() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let root = std::env::temp_dir().join(format!("pandacode-relink-{}", id()));
+        std::fs::create_dir_all(root.join("one")).unwrap();
+        std::fs::create_dir_all(root.join("two")).unwrap();
+        let one = store.add_project(&root.join("one")).unwrap();
+        let two = store.add_project(&root.join("two")).unwrap();
+        // The folder was renamed away, so the chosen path does not resolve.
+        assert!(store.relink_project(&one.id, &root.join("gone")).is_err());
+        // Relative paths would resolve against the app's working directory.
+        assert!(store.relink_project(&one.id, Path::new("two")).is_err());
+        // The chats root itself is PandaCode's, not a project folder.
+        assert!(store.relink_project(&one.id, &crate::chats::root()).is_err());
+        // Another project already lives at the chosen folder.
+        assert!(store.relink_project(&one.id, &root.join("two")).is_err());
+        assert_eq!(store.project(&one.id).unwrap().path, one.path, "failed relinks keep the stored path");
+        assert_eq!(store.project(&two.id).unwrap().path, two.path);
+        // A file is not a folder.
+        std::fs::write(root.join("file.txt"), "x").unwrap();
+        assert!(store.relink_project(&one.id, &root.join("file.txt")).is_err());
+        // Chat folders are PandaCode-managed and never relinked; the stored path is
+        // inserted directly because add_project would refuse the missing folder.
+        let chat_folder = crate::chats::root().join("chat-re1inktest");
+        store.db.execute("INSERT INTO projects(id,name,path) VALUES ('chat-proj','Chat',?1)",
+            params![chat_folder.to_string_lossy().to_string()]).unwrap();
+        assert!(store.relink_project("chat-proj", &root.join("one")).is_err());
+        // A project cannot be relinked into the chats root either.
+        assert!(store.relink_project(&one.id, &crate::chats::root().join("chat-new")).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_draft_open_during_a_reorder_stays_unranked_and_publishes_to_the_top() {
         let (store, first) = empty_session();
         let second = store.create_session(&first.project_id, "claude", "sonnet", "auto").unwrap();
@@ -2166,7 +2318,7 @@ mod tests {
         for (provider, title, details) in [
             ("bad", "Valid", ""),
             ("codex", "  ", ""),
-            ("codex", "Valid", &"x".repeat(128 * 1024 + 1)),
+            ("codex", "Valid", &"x".repeat(crate::MESSAGE_LIMIT + 1)),
         ] {
             assert!(store
                 .create_board_task(
@@ -2329,6 +2481,26 @@ mod tests {
         assert_eq!(review.updated_at, 9);
         assert!(!store.session(&live.id).unwrap().archived);
         assert_eq!(store.settle_archived().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_corrupt_team_row_never_stops_the_store_opening() {
+        let directory = std::env::temp_dir().join(format!("pandacode-corrupt-team-{}", id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("store.sqlite");
+        drop(Store::open(&path).unwrap());
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch("PRAGMA foreign_keys=OFF;
+                INSERT INTO architect_teams(session_id,content) VALUES('not-json','{broken'),('bad-worker','{\"status\":\"running\",\"workers\":[\"x\",{\"status\":\"running\"}]}');").unwrap();
+        }
+        drop(Store::open(&path).unwrap());
+        let db = Connection::open(&path).unwrap();
+        let broken: String = db.query_row("SELECT content FROM architect_teams WHERE session_id='not-json'", [], |row| row.get(0)).unwrap();
+        assert_eq!(broken, "{broken");
+        let worker: String = db.query_row("SELECT json_extract(content,'$.workers[0].status') FROM architect_teams WHERE session_id='bad-worker'", [], |row| row.get(0)).unwrap();
+        assert_eq!(worker, "stopped");
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]

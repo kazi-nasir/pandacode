@@ -1,6 +1,6 @@
 import type { ContextUsage, Provider, ProviderId, ProviderModel } from './types';
 import { advertisedModelsOnly, fallbackModel, modelChoices, tokenCount } from './model-catalog';
-import { escape, icon } from './dom';
+import { escape, icon, isImeKey } from './dom';
 import { providerLogo } from './provider-logos';
 import { showPopover, hidePopover } from './popover-motion';
 import { trackSegment } from './motion';
@@ -31,7 +31,7 @@ type ModelPickerOptions = {
 };
 
 const RECENT_LIMIT = 5;
-const WIDTH = 460;
+const WIDTH = 520;
 const HEIGHT = 440;
 const recentKey = (provider: ProviderId) => `pandacode.recent-models.${provider}`;
 function storedRecent(provider: ProviderId): string[] {
@@ -195,8 +195,15 @@ export function openModelPicker(options: ModelPickerOptions): () => void {
     return `<span class="model-menu-stack">${roster.map(id => providerLogo(id)).join('')}</span>`;
   }
 
+  /** "lead · N workers": the lead may truncate, the count may not. */
+  function teamDetail(detail: string): string {
+    const split = detail.lastIndexOf(' · ');
+    if (split < 0) return `<span class="model-menu-meta-lead">${escape(detail)}</span>`;
+    return `<span class="model-menu-meta-lead">${escape(detail.slice(0, split))}</span><span class="model-menu-meta-count">${escape(detail.slice(split))}</span>`;
+  }
+
   function teamRow(team: PickerTeam): string {
-    return `<button type="button" role="option" tabindex="-1" class="model-menu-option model-menu-team${team.selected ? ' model-menu-current' : ''}" data-team="${escape(team.id)}" data-provider="team" data-model="${escape(team.id)}" data-available="true" aria-label="${escape(`Agent team · ${team.name}`)}" title="${escape(`${team.name} · ${team.detail}`)}" ${team.selected ? 'aria-current="true"' : ''}>${teamLogos(team)}<span class="model-menu-name">${escape(team.name)}</span><span class="model-menu-meta">${escape(team.detail)}</span>${team.selected ? icon('check', 'model-menu-check') : ''}</button>`;
+    return `<button type="button" role="option" tabindex="-1" class="model-menu-option model-menu-team${team.selected ? ' model-menu-current' : ''}" data-team="${escape(team.id)}" data-provider="team" data-model="${escape(team.id)}" data-available="true" aria-label="${escape(`Agent team · ${team.name}`)}" title="${escape(`${team.name} · ${team.detail}`)}" ${team.selected ? 'aria-current="true"' : ''}>${teamLogos(team)}<span class="model-menu-name">${escape(team.name)}</span><span class="model-menu-meta">${teamDetail(team.detail)}</span>${team.selected ? icon('check', 'model-menu-check') : ''}</button>`;
   }
 
   /** One line: name left, context (or the harness in mixed lists) right, a check on the current model. */
@@ -213,7 +220,7 @@ export function openModelPicker(options: ModelPickerOptions): () => void {
   }
 
   function heading(logo: string, name: string, status = ''): string {
-    return `<div class="model-menu-group-heading">${logo}<h3>${escape(name)}</h3>${status}</div>`;
+    return `<div class="model-menu-group-heading" role="presentation">${logo}<span class="model-menu-group-name">${escape(name)}</span>${status}</div>`;
   }
 
   function railItem(key: string, logo: string, name: string, count: string, classes: string, selected: boolean, label = name, tip = ''): string {
@@ -241,7 +248,7 @@ export function openModelPicker(options: ModelPickerOptions): () => void {
     const inUse = (key: string) => !teamSelected && key === (currentConnection ? `c:${currentConnection}` : `h:${current.provider}`);
     let railHtml = '';
     if (recent.length) railHtml += railItem('recent', icon('undo'), 'Recent', '', query ? ' is-dim' : '', !query && view === 'recent');
-    if (teams.length) railHtml += railItem('teams', icon('worktree'), 'Teams', String(query ? matchedTeams.length || '' : teams.length), `${teamSelected ? ' has-current' : ''}${query && !matchedTeams.length ? ' is-dim' : ''}`, !query && view === 'teams', `Teams, ${teams.length}`);
+    if (teams.length) railHtml += railItem('teams', icon('team'), 'Teams', String(query ? matchedTeams.length || '' : teams.length), `${teamSelected ? ' has-current' : ''}${query && !matchedTeams.length ? ' is-dim' : ''}`, !query && view === 'teams', `Teams, ${teams.length}`);
     if (all.length) railHtml += '<div class="model-menu-rail-heading" role="presentation">Harnesses</div>';
     railHtml += all.map(group => {
       const count = query ? hits.get(group.key)!.length : 0;
@@ -274,7 +281,7 @@ export function openModelPicker(options: ModelPickerOptions): () => void {
       markup = heading(icon('undo'), 'Recent') + recent.map(row => modelRow(row, true, '')).join('');
     } else if (view === 'teams') {
       total = teams.length;
-      markup = heading(icon('worktree'), 'Agent teams', '<span>Lead and workers</span>') + teams.map(teamRow).join('');
+      markup = heading(icon('team'), 'Agent teams', '<span>Lead and workers</span>') + teams.map(teamRow).join('');
     } else {
       const group = all.find(group => group.key === view);
       if (group) {
@@ -529,7 +536,7 @@ export function openModelPicker(options: ModelPickerOptions): () => void {
       else if (key === 'Enter' || key === 'ArrowRight') { event.preventDefault(); search.focus({ preventScroll: true }); }
       return;
     }
-    if (target !== search) return;
+    if (target !== search || isImeKey(event)) return;
     if (key === 'ArrowDown' || key === 'ArrowUp') { event.preventDefault(); moveActive(key === 'ArrowDown' ? 1 : -1); }
     else if (key === 'Home' || key === 'End') { event.preventDefault(); moveActive(key === 'Home' ? 'first' : 'last'); }
     else if ((key === 'ArrowLeft' || key === 'ArrowRight') && !search.value) { event.preventDefault(); stepView(key === 'ArrowRight' ? 1 : -1, false); }
